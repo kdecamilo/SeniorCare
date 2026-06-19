@@ -622,17 +622,42 @@ class SeniorCareDb {
     required String detalle,
     int? idEmpleado,
   }) async {
-    if (solicitud.idSolicitud == null) return;
+    if (solicitud.idSolicitud == null) {
+      throw Exception('La solicitud no tiene id_solicitud. No se puede guardar historial.');
+    }
+
     final idEstado = await idEstadoSolPorNombre(estado);
-    final empleado =
-        idEmpleado ?? await idEmpleadoPorNombreCompleto(profesionalActual);
-    if (idEstado == null || empleado == null) return;
+    if (idEstado == null) {
+      throw Exception('No existe el estado "$estado" en la tabla estado_sol.');
+    }
+
+    // Se intenta obtener el empleado por varias vías para evitar que el guardado falle
+    // si el nombre completo tiene espacios, segundo nombre o diferencias de formato.
+    final empleado = idEmpleado ??
+        solicitud.idEmpleadoAsignado ??
+        empleadoSesion?.idEmpleado ??
+        await idEmpleadoPorNombreCompleto(profesionalActual);
+
+    if (empleado == null) {
+      throw Exception('No se pudo obtener el id_empleado del profesional actual.');
+    }
+
     await db.from('historial_sol').insert({
       'descripcion_hist': detalle,
       'id_solicitud': solicitud.idSolicitud,
       'id_est': idEstado,
       'id_empleado': empleado,
     });
+
+    // También se guarda el estado en la asignación cuando existe id_asig.
+    // Esto ayuda a que administrador y empleado vean el mismo estado actualizado.
+    final idEstadoAsignacion = await idEstadoAsigPorNombre(estado);
+    if (idEstadoAsignacion != null && solicitud.idAsignacion != null) {
+      await db.from('asig_estado').insert({
+        'id_est_asig': idEstadoAsignacion,
+        'id_asig': solicitud.idAsignacion,
+      });
+    }
   }
 
   static Future<void> actualizarHabitacionPaciente(
@@ -2143,6 +2168,28 @@ class _LoginPageState extends State<LoginPage> {
             estadoNombre = (eDb['nombre'] ?? 'Asignada').toString();
         } else {
           estadoNombre = 'Asignada';
+        }
+      }
+
+      // Revisa el último estado real guardado por el profesional en historial_sol.
+      // La tabla solicitud no tiene columna estado, por eso el estado actual se recupera
+      // desde el último registro de historial_sol.
+      final histDb = await supabase
+          .from('historial_sol')
+          .select('id_est, fecha')
+          .eq('id_solicitud', sol['id_solicitud'])
+          .order('fecha', ascending: false)
+          .limit(1)
+          .maybeSingle();
+
+      if (histDb != null && histDb['id_est'] != null) {
+        final estadoDb = await supabase
+            .from('estado_sol')
+            .select('nombre_estado')
+            .eq('id_est', histDb['id_est'])
+            .maybeSingle();
+        if (estadoDb != null) {
+          estadoNombre = (estadoDb['nombre_estado'] ?? estadoNombre).toString();
         }
       }
 

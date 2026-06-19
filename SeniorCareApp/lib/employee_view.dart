@@ -526,69 +526,149 @@ class _ProfessionalTasksPageState extends State<ProfessionalTasksPage> {
     );
   }
 
-  void marcarPendienteProfesional(Solicitud solicitud) {
+  Future<void> guardarEstadoSolicitudEnSupabase(
+      Solicitud solicitud,
+      String estado,
+      String detalle,
+      ) async {
+    await SeniorCareDb.registrarHistorialSolicitud(
+      solicitud: solicitud,
+      estado: estado,
+      detalle: detalle,
+    );
+  }
+
+  Future<void> marcarPendienteProfesional(Solicitud solicitud) async {
+    final estadoAnterior = solicitud.estado;
     final hora = formatDateTime(DateTime.now());
     setState(() {
       solicitud.estado = 'Pendiente';
     });
-    registrarHistorial(
-      'Solicitud marcada pendiente',
-      '${solicitud.titulo} fue marcada como pendiente por $profesionalActual a las $hora.',
-    );
-    ScaffoldMessenger.of(context).showSnackBar(
-      const SnackBar(content: Text('Solicitud marcada como pendiente')),
-    );
+
+    try {
+      await guardarEstadoSolicitudEnSupabase(
+        solicitud,
+        'Pendiente',
+        '${solicitud.titulo} fue marcada como pendiente por $profesionalActual a las $hora.',
+      );
+      registrarHistorial(
+        'Solicitud marcada pendiente',
+        '${solicitud.titulo} fue marcada como pendiente por $profesionalActual a las $hora.',
+      );
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(content: Text('Solicitud marcada como pendiente')),
+      );
+    } catch (e) {
+      setState(() => solicitud.estado = estadoAnterior);
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(content: Text('Error al guardar en Supabase: $e'), backgroundColor: Colors.red),
+      );
+    }
   }
 
-  void aceptarSolicitud(Solicitud solicitud) {
+  Future<void> aceptarSolicitud(Solicitud solicitud) async {
+    final estadoAnterior = solicitud.estado;
+    final horaAnterior = solicitud.horaAsignacion;
     final hora = formatDateTime(DateTime.now());
     setState(() {
       solicitud.estado = 'Aceptada';
       solicitud.horaAsignacion ??= hora;
     });
-    registrarHistorial(
-      'Solicitud aceptada por profesional',
-      '${solicitud.titulo} fue aceptada por $profesionalActual a las $hora.',
-    );
-    ScaffoldMessenger.of(context).showSnackBar(
-      const SnackBar(content: Text('Solicitud aceptada correctamente')),
-    );
+
+    try {
+      await guardarEstadoSolicitudEnSupabase(
+        solicitud,
+        'Aceptada',
+        '${solicitud.titulo} fue aceptada por $profesionalActual a las $hora.',
+      );
+      registrarHistorial(
+        'Solicitud aceptada por profesional',
+        '${solicitud.titulo} fue aceptada por $profesionalActual a las $hora.',
+      );
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(content: Text('Solicitud aceptada correctamente')),
+      );
+    } catch (e) {
+      setState(() {
+        solicitud.estado = estadoAnterior;
+        solicitud.horaAsignacion = horaAnterior;
+      });
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(content: Text('Error al guardar en Supabase: $e'), backgroundColor: Colors.red),
+      );
+    }
   }
 
-  void iniciarSolicitudProfesional(Solicitud solicitud) {
+  Future<void> iniciarSolicitudProfesional(Solicitud solicitud) async {
+    final estadoAnterior = solicitud.estado;
+    final horaInicioAnterior = solicitud.horaInicioAtencion;
     final hora = formatDateTime(DateTime.now());
     setState(() {
       solicitud.estado = 'En Proceso';
       solicitud.horaInicioAtencion = hora;
     });
-    registrarHistorial(
-      'Inicio de atención',
-      '${solicitud.titulo} fue iniciada por $profesionalActual a las $hora.',
-    );
-    ScaffoldMessenger.of(context).showSnackBar(
-      const SnackBar(content: Text('Atención iniciada correctamente')),
-    );
+
+    try {
+      await guardarEstadoSolicitudEnSupabase(
+        solicitud,
+        'En Proceso',
+        '${solicitud.titulo} fue iniciada por $profesionalActual a las $hora.',
+      );
+      registrarHistorial(
+        'Inicio de atención',
+        '${solicitud.titulo} fue iniciada por $profesionalActual a las $hora.',
+      );
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(content: Text('Atención iniciada correctamente')),
+      );
+    } catch (e) {
+      setState(() {
+        solicitud.estado = estadoAnterior;
+        solicitud.horaInicioAtencion = horaInicioAnterior;
+      });
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(content: Text('Error al guardar en Supabase: $e'), backgroundColor: Colors.red),
+      );
+    }
   }
 
-  void finalizarSolicitudProfesional(Solicitud solicitud) {
+  Future<void> finalizarSolicitudProfesional(Solicitud solicitud) async {
+    final estadoAnterior = solicitud.estado;
+    final horaFinalizacionAnterior = solicitud.horaFinalizacion;
     final hora = formatDateTime(DateTime.now());
     setState(() {
       solicitud.estado = 'Completada';
       solicitud.horaFinalizacion = hora;
     });
-    registrarHistorial(
-      'Finalización de atención',
-      '${solicitud.titulo} fue finalizada por $profesionalActual a las $hora.',
-    );
-    registrarHistorialProfesional(
-      profesional: profesionalActual,
-      solicitud: solicitud,
-      estadoFinal: 'Completada',
-      detalle: 'Solicitud finalizada correctamente a las $hora.',
-    );
-    ScaffoldMessenger.of(context).showSnackBar(
-      const SnackBar(content: Text('Solicitud finalizada correctamente')),
-    );
+
+    try {
+      await guardarEstadoSolicitudEnSupabase(
+        solicitud,
+        'Completada',
+        '${solicitud.titulo} fue finalizada por $profesionalActual a las $hora.',
+      );
+      registrarHistorial(
+        'Finalización de atención',
+        '${solicitud.titulo} fue finalizada por $profesionalActual a las $hora.',
+      );
+      registrarHistorialProfesional(
+        profesional: profesionalActual,
+        solicitud: solicitud,
+        estadoFinal: 'Completada',
+        detalle: 'Solicitud finalizada correctamente a las $hora.',
+      );
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(content: Text('Solicitud finalizada correctamente')),
+      );
+    } catch (e) {
+      setState(() {
+        solicitud.estado = estadoAnterior;
+        solicitud.horaFinalizacion = horaFinalizacionAnterior;
+      });
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(content: Text('Error al guardar en Supabase: $e'), backgroundColor: Colors.red),
+      );
+    }
   }
 
   void cancelarSolicitudProfesional(Solicitud solicitud) {
@@ -610,7 +690,11 @@ class _ProfessionalTasksPageState extends State<ProfessionalTasksPage> {
             child: const Text('Volver'),
           ),
           FilledButton(
-            onPressed: () {
+            onPressed: () async {
+              final estadoAnterior = solicitud.estado;
+              final horaCancelacionAnterior = solicitud.horaCancelacion;
+              final motivoCancelacionAnterior = solicitud.motivoCancelacion;
+              final asignadoAnterior = solicitud.asignadoA;
               final hora = formatDateTime(DateTime.now());
               final motivo = motivoController.text.trim().isEmpty
                   ? 'Sin motivo registrado'
@@ -621,24 +705,42 @@ class _ProfessionalTasksPageState extends State<ProfessionalTasksPage> {
                 solicitud.motivoCancelacion = motivo;
                 solicitud.asignadoA = 'Sin asignar';
               });
-              registrarHistorial(
-                'Solicitud cancelada por profesional',
-                '${solicitud.titulo} fue cancelada por $profesionalActual a las $hora. Motivo: $motivo.',
-              );
-              registrarHistorialProfesional(
-                profesional: profesionalActual,
-                solicitud: solicitud,
-                estadoFinal: 'Cancelada',
-                detalle: 'Cancelada a las $hora. Motivo: $motivo.',
-              );
-              Navigator.pop(dialogContext);
-              ScaffoldMessenger.of(context).showSnackBar(
-                const SnackBar(
-                  content: Text(
-                    'Solicitud cancelada. El administrador podrá reasignarla si corresponde.',
+
+              try {
+                await guardarEstadoSolicitudEnSupabase(
+                  solicitud,
+                  'Cancelada',
+                  '${solicitud.titulo} fue cancelada por $profesionalActual a las $hora. Motivo: $motivo.',
+                );
+                registrarHistorial(
+                  'Solicitud cancelada por profesional',
+                  '${solicitud.titulo} fue cancelada por $profesionalActual a las $hora. Motivo: $motivo.',
+                );
+                registrarHistorialProfesional(
+                  profesional: profesionalActual,
+                  solicitud: solicitud,
+                  estadoFinal: 'Cancelada',
+                  detalle: 'Cancelada a las $hora. Motivo: $motivo.',
+                );
+                Navigator.pop(dialogContext);
+                ScaffoldMessenger.of(context).showSnackBar(
+                  const SnackBar(
+                    content: Text(
+                      'Solicitud cancelada. El administrador podrá reasignarla si corresponde.',
+                    ),
                   ),
-                ),
-              );
+                );
+              } catch (e) {
+                setState(() {
+                  solicitud.estado = estadoAnterior;
+                  solicitud.horaCancelacion = horaCancelacionAnterior;
+                  solicitud.motivoCancelacion = motivoCancelacionAnterior;
+                  solicitud.asignadoA = asignadoAnterior;
+                });
+                ScaffoldMessenger.of(context).showSnackBar(
+                  SnackBar(content: Text('Error al guardar en Supabase: $e'), backgroundColor: Colors.red),
+                );
+              }
             },
             child: const Text('Cancelar solicitud'),
           ),
@@ -704,37 +806,78 @@ class _ProfessionalTasksPageState extends State<ProfessionalTasksPage> {
               child: const Text('Cancelar'),
             ),
             FilledButton(
-              onPressed: () {
+              onPressed: () async {
+                final empleadoAnterior = solicitud.asignadoA;
+                final estadoAnterior = solicitud.estado;
+                final horaReasignacionAnterior = solicitud.horaReasignacion;
+                final motivoReasignacionAnterior = solicitud.motivoReasignacion;
+                final horaInicioAnterior = solicitud.horaInicioAtencion;
+                final horaFinalizacionAnterior = solicitud.horaFinalizacion;
+                final horaCancelacionAnterior = solicitud.horaCancelacion;
+                final idEmpleadoAnterior = solicitud.idEmpleadoAsignado;
                 final hora = formatDateTime(DateTime.now());
                 final motivo = motivoController.text.trim().isEmpty
                     ? 'Sin descripción registrada'
                     : motivoController.text.trim();
-                setState(() {
-                  solicitud.asignadoA = nuevoEmpleado;
-                  solicitud.estado = 'Reasignada';
-                  solicitud.horaReasignacion = hora;
-                  solicitud.motivoReasignacion = motivo;
-                  solicitud.horaInicioAtencion = null;
-                  solicitud.horaFinalizacion = null;
-                  solicitud.horaCancelacion = null;
-                });
-                registrarHistorial(
-                  'Solicitud reasignada por profesional',
-                  '${solicitud.titulo} fue reasignada por $profesionalActual a $nuevoEmpleado a las $hora. Motivo: $motivo.',
-                );
-                registrarHistorialProfesional(
-                  profesional: profesionalActual,
-                  solicitud: solicitud,
-                  estadoFinal: 'Reasignada',
-                  detalle:
-                  'Reasignada a $nuevoEmpleado a las $hora. Motivo: $motivo.',
-                );
-                Navigator.pop(dialogContext);
-                ScaffoldMessenger.of(context).showSnackBar(
-                  const SnackBar(
-                    content: Text('Solicitud reasignada correctamente'),
-                  ),
-                );
+
+                try {
+                  final idNuevoEmpleado = await SeniorCareDb.asignarSolicitud(
+                    solicitud: solicitud,
+                    empleadoNombre: nuevoEmpleado,
+                    reasignar: true,
+                    descripcion: motivo,
+                  );
+                  if (idNuevoEmpleado == null) {
+                    throw Exception('No se pudo encontrar el nuevo empleado en Supabase.');
+                  }
+                  await guardarEstadoSolicitudEnSupabase(
+                    solicitud,
+                    'Reasignada',
+                    '${solicitud.titulo} fue reasignada por $profesionalActual a $nuevoEmpleado a las $hora. Motivo: $motivo.',
+                  );
+
+                  setState(() {
+                    solicitud.idEmpleadoAsignado = idNuevoEmpleado;
+                    solicitud.asignadoA = nuevoEmpleado;
+                    solicitud.estado = 'Reasignada';
+                    solicitud.horaReasignacion = hora;
+                    solicitud.motivoReasignacion = motivo;
+                    solicitud.horaInicioAtencion = null;
+                    solicitud.horaFinalizacion = null;
+                    solicitud.horaCancelacion = null;
+                  });
+                  registrarHistorial(
+                    'Solicitud reasignada por profesional',
+                    '${solicitud.titulo} fue reasignada por $profesionalActual a $nuevoEmpleado a las $hora. Motivo: $motivo.',
+                  );
+                  registrarHistorialProfesional(
+                    profesional: profesionalActual,
+                    solicitud: solicitud,
+                    estadoFinal: 'Reasignada',
+                    detalle:
+                    'Reasignada a $nuevoEmpleado a las $hora. Motivo: $motivo.',
+                  );
+                  Navigator.pop(dialogContext);
+                  ScaffoldMessenger.of(context).showSnackBar(
+                    const SnackBar(
+                      content: Text('Solicitud reasignada correctamente'),
+                    ),
+                  );
+                } catch (e) {
+                  setState(() {
+                    solicitud.idEmpleadoAsignado = idEmpleadoAnterior;
+                    solicitud.asignadoA = empleadoAnterior;
+                    solicitud.estado = estadoAnterior;
+                    solicitud.horaReasignacion = horaReasignacionAnterior;
+                    solicitud.motivoReasignacion = motivoReasignacionAnterior;
+                    solicitud.horaInicioAtencion = horaInicioAnterior;
+                    solicitud.horaFinalizacion = horaFinalizacionAnterior;
+                    solicitud.horaCancelacion = horaCancelacionAnterior;
+                  });
+                  ScaffoldMessenger.of(context).showSnackBar(
+                    SnackBar(content: Text('Error al reasignar en Supabase: $e'), backgroundColor: Colors.red),
+                  );
+                }
               },
               child: const Text('Reasignar'),
             ),

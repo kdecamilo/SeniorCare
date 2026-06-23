@@ -257,6 +257,8 @@ class ContactoEmergencia {
 
 // Modelo temporal para permisos especiales entregados a profesionales durante su jornada.
 class PermisoTemporal {
+  int? idPermiso;
+  int? idEmpleado;
   String empleado;
   String permiso;
   DateTime inicio;
@@ -268,6 +270,8 @@ class PermisoTemporal {
   String? horaRevocado;
 
   PermisoTemporal({
+    this.idPermiso,
+    this.idEmpleado,
     required this.empleado,
     required this.permiso,
     required this.inicio,
@@ -276,6 +280,13 @@ class PermisoTemporal {
     String? horaOtorgado,
     this.horaRevocado,
   }) : horaOtorgado = horaOtorgado ?? formatDateTime(DateTime.now());
+
+  bool get activoAhora {
+    final ahora = DateTime.now();
+    return estado == 'Activo' &&
+        (ahora.isAtSameMomentAs(inicio) || ahora.isAfter(inicio)) &&
+        ahora.isBefore(termino);
+  }
 }
 
 // Modelo temporal para registrar acciones importantes realizadas en el sistema por administración.
@@ -638,16 +649,19 @@ class SeniorCareDb {
         empleadoSesion?.idEmpleado ??
         await idEmpleadoPorNombreCompleto(profesionalActual);
 
-    if (empleado == null) {
-      throw Exception('No se pudo obtener el id_empleado del profesional actual.');
-    }
-
-    await db.from('historial_sol').insert({
+    final datosHistorial = <String, dynamic>{
       'descripcion_hist': detalle,
       'id_solicitud': solicitud.idSolicitud,
       'id_est': idEstado,
-      'id_empleado': empleado,
-    });
+    };
+
+    // Para acciones del administrador puede no existir un empleado asociado.
+    // Si la solicitud tiene empleado asignado se guarda; si no, se registra sin id_empleado.
+    if (empleado != null) {
+      datosHistorial['id_empleado'] = empleado;
+    }
+
+    await db.from('historial_sol').insert(datosHistorial);
 
     // También se guarda el estado en la asignación cuando existe id_asig.
     // Esto ayuda a que administrador y empleado vean el mismo estado actualizado.
@@ -680,6 +694,94 @@ class SeniorCareDb {
         .from('paciente')
         .update({'estado': estado})
         .eq('id_paciente', paciente.idPaciente!);
+  }
+
+
+  static Future<void> registrarPacienteInactivo({
+    required Paciente paciente,
+    required String motivo,
+    required String descripcion,
+    required String responsable,
+  }) async {
+    if (paciente.idPaciente == null) {
+      throw Exception('El paciente no tiene id_paciente. No se puede guardar historial.');
+    }
+
+    await db.from('historial_paciente_inactivo').insert({
+      'id_paciente': paciente.idPaciente,
+      'motivo': motivo,
+      'descripcion': descripcion,
+      'responsable': responsable,
+      'estado_accion': 'Inactivo',
+    });
+  }
+
+  static Future<void> registrarPacienteReactivado({
+    required Paciente paciente,
+    required String responsable,
+  }) async {
+    if (paciente.idPaciente == null) return;
+
+    await db.from('historial_paciente_inactivo').insert({
+      'id_paciente': paciente.idPaciente,
+      'motivo': 'Reactivación',
+      'descripcion': 'Paciente reactivado y habilitado nuevamente para usar la aplicación.',
+      'responsable': responsable,
+      'estado_accion': 'Reactivado',
+    });
+  }
+
+  static Future<void> cargarHistorialPacientesInactivosDesdeSupabase() async {
+    historialPacientesInactivos.clear();
+
+    final data = await db
+        .from('historial_paciente_inactivo')
+        .select('id_historial, id_paciente, motivo, descripcion, fecha, responsable, estado_accion')
+        .order('fecha', ascending: false);
+
+    final ultimoInactivoPorPaciente = <int, Map<String, dynamic>>{};
+
+    for (final h in List<Map<String, dynamic>>.from(data)) {
+      final accion = (h['estado_accion'] ?? 'Inactivo').toString();
+      final idPaciente = h['id_paciente'] as int?;
+      if (idPaciente == null) continue;
+
+      final pacienteRelacionado = pacientes.where((p) => p.idPaciente == idPaciente).toList();
+      if (pacienteRelacionado.isEmpty) continue;
+
+      final fechaDb = DateTime.tryParse((h['fecha'] ?? '').toString());
+      final fechaTexto = fechaDb == null ? '' : formatDateTime(fechaDb.toLocal());
+
+      if (accion == 'Inactivo') {
+        final registro = HistorialPacienteInactivo(
+          paciente: pacienteRelacionado.first.nombre,
+          motivo: (h['motivo'] ?? '').toString(),
+          descripcion: (h['descripcion'] ?? '').toString(),
+          fecha: fechaTexto,
+          responsable: (h['responsable'] ?? 'Administrador').toString(),
+        );
+
+        historialPacientesInactivos.add(registro);
+        ultimoInactivoPorPaciente.putIfAbsent(idPaciente, () => h);
+      }
+    }
+
+    for (final paciente in pacientes) {
+      if (paciente.estado != 'Inactivo' || paciente.idPaciente == null) {
+        paciente.motivoInactividad = '';
+        paciente.descripcionInactividad = '';
+        paciente.fechaInactividad = '';
+        continue;
+      }
+
+      final ultimo = ultimoInactivoPorPaciente[paciente.idPaciente!];
+      if (ultimo == null) continue;
+
+      final fechaDb = DateTime.tryParse((ultimo['fecha'] ?? '').toString());
+      paciente.motivoInactividad = (ultimo['motivo'] ?? '').toString();
+      paciente.descripcionInactividad = (ultimo['descripcion'] ?? '').toString();
+      paciente.fechaInactividad = fechaDb == null ? '' : formatDateTime(fechaDb.toLocal());
+    }
   }
 
   static Future<int?> crearTurno(Turno turno) async {
@@ -831,6 +933,124 @@ class SeniorCareDb {
       await db.from('turno').delete().eq('id_empleado', empleado.idEmpleado!);
     }
   }
+
+  static Future<int?> guardarPermisoTemporal(PermisoTemporal permiso) async {
+    final empleado = empleados
+        .where((e) => e.nombre == permiso.empleado)
+        .toList();
+
+    if (empleado.isEmpty || empleado.first.idEmpleado == null) {
+      throw Exception('No se encontró el empleado en Supabase.');
+    }
+
+    permiso.idEmpleado = empleado.first.idEmpleado;
+
+    final insertado = await db
+        .from('permiso_temporal')
+        .insert({
+      'permiso': permiso.permiso,
+      'fecha_inicio': permiso.inicio.toIso8601String(),
+      'fecha_termino': permiso.termino.toIso8601String(),
+      'estado': permiso.estado,
+      'descripcion': 'Permiso temporal otorgado desde administración',
+      'id_empleado': permiso.idEmpleado,
+    })
+        .select('id_permiso')
+        .single();
+
+    return insertado['id_permiso'] as int?;
+  }
+
+  static Future<void> cargarPermisosTemporalesDesdeSupabase() async {
+    permisosTemporales.clear();
+
+    for (final empleado in empleados) {
+      empleado.permisoAdminTemporal = false;
+    }
+
+    final data = await db
+        .from('permiso_temporal')
+        .select('id_permiso, permiso, fecha_inicio, fecha_termino, estado, fecha_registro, id_empleado')
+        .order('fecha_registro', ascending: false);
+
+    for (final p in List<Map<String, dynamic>>.from(data)) {
+      final empleadoRelacionado = empleados
+          .where((e) => e.idEmpleado == p['id_empleado'])
+          .toList();
+
+      if (empleadoRelacionado.isEmpty) continue;
+
+      final inicio = DateTime.tryParse((p['fecha_inicio'] ?? '').toString());
+      final termino = DateTime.tryParse((p['fecha_termino'] ?? '').toString());
+      final registro = DateTime.tryParse((p['fecha_registro'] ?? '').toString());
+
+      if (inicio == null || termino == null) continue;
+
+      final permiso = PermisoTemporal(
+        idPermiso: p['id_permiso'] as int?,
+        idEmpleado: p['id_empleado'] as int?,
+        empleado: empleadoRelacionado.first.nombre,
+        permiso: (p['permiso'] ?? '').toString(),
+        inicio: inicio.toLocal(),
+        termino: termino.toLocal(),
+        estado: (p['estado'] ?? 'Activo').toString(),
+        horaOtorgado: registro == null ? formatDateTime(DateTime.now()) : formatDateTime(registro.toLocal()),
+      );
+
+      permisosTemporales.add(permiso);
+
+      if (permiso.activoAhora) {
+        empleadoRelacionado.first.permisoAdminTemporal = true;
+      }
+    }
+  }
+
+  static Future<void> revocarPermisoTemporal(PermisoTemporal permiso) async {
+    if (permiso.idPermiso == null) return;
+
+    await db
+        .from('permiso_temporal')
+        .update({'estado': 'Revocado'})
+        .eq('id_permiso', permiso.idPermiso!);
+  }
+
+
+  static Future<void> cancelarSolicitudAdmin({
+    required Solicitud solicitud,
+    required String motivo,
+  }) async {
+    await registrarHistorialSolicitud(
+      solicitud: solicitud,
+      estado: 'Cancelada',
+      detalle: motivo,
+    );
+  }
+
+  static Future<void> eliminarSolicitudCompleta(Solicitud solicitud) async {
+    if (solicitud.idSolicitud == null) {
+      throw Exception('La solicitud no tiene id_solicitud.');
+    }
+
+    final idSolicitud = solicitud.idSolicitud!;
+
+    final asignaciones = await db
+        .from('asignacion')
+        .select('id_asig')
+        .eq('id_solicitud', idSolicitud);
+
+    for (final a in List<Map<String, dynamic>>.from(asignaciones)) {
+      final idAsig = a['id_asig'];
+      if (idAsig != null) {
+        await db.from('asig_estado').delete().eq('id_asig', idAsig);
+      }
+    }
+
+    await db.from('historial_sol').delete().eq('id_solicitud', idSolicitud);
+    await db.from('sol_prioridad').delete().eq('id_solicitud', idSolicitud);
+    await db.from('asignacion').delete().eq('id_solicitud', idSolicitud);
+    await db.from('solicitud').delete().eq('id_solicitud', idSolicitud);
+  }
+
 }
 
 // Paciente visible para pantallas de paciente. Si aún no se cargó desde Supabase,
@@ -938,6 +1158,96 @@ void sincronizarHabitacionesConPacientes() {
       h.estado = pacientesEnHabitacion.isEmpty ? 'Disponible' : 'Ocupada';
     }
   }
+}
+
+
+// Elimina registros duplicados en memoria después de refrescar desde Supabase.
+// Esto evita que al presionar el botón actualizar se repitan turnos, solicitudes,
+// pacientes, empleados, habitaciones o permisos temporales en las vistas.
+void eliminarDuplicadosSesionEnMemoria() {
+  final pacientesUnicos = <int, Paciente>{};
+  final pacientesSinId = <Paciente>[];
+  for (final p in pacientes) {
+    if (p.idPaciente != null) {
+      pacientesUnicos[p.idPaciente!] = p;
+    } else if (!pacientesSinId.any((x) => x.nombre == p.nombre && x.rut == p.rut)) {
+      pacientesSinId.add(p);
+    }
+  }
+  pacientes
+    ..clear()
+    ..addAll(pacientesUnicos.values)
+    ..addAll(pacientesSinId);
+
+  final empleadosUnicos = <int, Empleado>{};
+  final empleadosSinId = <Empleado>[];
+  for (final e in empleados) {
+    if (e.idEmpleado != null) {
+      empleadosUnicos[e.idEmpleado!] = e;
+    } else if (!empleadosSinId.any((x) => x.nombre == e.nombre && x.rut == e.rut)) {
+      empleadosSinId.add(e);
+    }
+  }
+  empleados
+    ..clear()
+    ..addAll(empleadosUnicos.values)
+    ..addAll(empleadosSinId);
+
+  final solicitudesUnicas = <int, Solicitud>{};
+  final solicitudesSinId = <Solicitud>[];
+  for (final s in solicitudes) {
+    if (s.idSolicitud != null) {
+      solicitudesUnicas[s.idSolicitud!] = s;
+    } else if (!solicitudesSinId.any((x) => x.titulo == s.titulo && x.paciente == s.paciente && x.horaCreacion == s.horaCreacion)) {
+      solicitudesSinId.add(s);
+    }
+  }
+  solicitudes
+    ..clear()
+    ..addAll(solicitudesUnicas.values)
+    ..addAll(solicitudesSinId);
+
+  final habitacionesUnicas = <int, Habitacion>{};
+  final habitacionesSinId = <Habitacion>[];
+  for (final h in habitaciones) {
+    if (h.idHabitacion != null) {
+      habitacionesUnicas[h.idHabitacion!] = h;
+    } else if (!habitacionesSinId.any((x) => x.numero == h.numero)) {
+      habitacionesSinId.add(h);
+    }
+  }
+  habitaciones
+    ..clear()
+    ..addAll(habitacionesUnicas.values)
+    ..addAll(habitacionesSinId);
+
+  final turnosUnicos = <int, Turno>{};
+  final turnosSinId = <Turno>[];
+  for (final t in turnos) {
+    if (t.idTurno != null) {
+      turnosUnicos[t.idTurno!] = t;
+    } else if (!turnosSinId.any((x) => x.empleado == t.empleado && x.fecha == t.fecha && x.horaInicio == t.horaInicio && x.horaTermino == t.horaTermino)) {
+      turnosSinId.add(t);
+    }
+  }
+  turnos
+    ..clear()
+    ..addAll(turnosUnicos.values)
+    ..addAll(turnosSinId);
+
+  final permisosUnicos = <int, PermisoTemporal>{};
+  final permisosSinId = <PermisoTemporal>[];
+  for (final p in permisosTemporales) {
+    if (p.idPermiso != null) {
+      permisosUnicos[p.idPermiso!] = p;
+    } else if (!permisosSinId.any((x) => x.empleado == p.empleado && x.permiso == p.permiso && x.inicio == p.inicio && x.termino == p.termino)) {
+      permisosSinId.add(p);
+    }
+  }
+  permisosTemporales
+    ..clear()
+    ..addAll(permisosUnicos.values)
+    ..addAll(permisosSinId);
 }
 
 // Selector de hora con ruedas, similar al ejemplo enviado, usando textos en español.
@@ -1086,34 +1396,384 @@ String formatearRut(String rutLimpio) {
 
 bool validarRutChileno(String rut) {
   final limpio = limpiarRut(rut);
-  if (limpio.length < 2 || limpio.length > 9) return false;
+  // Para el prototipo se valida que el RUT tenga un formato viable en Chile:
+  // 7 u 8 números en el cuerpo + dígito verificador 0-9 o K.
+  // Esto permite ingresar RUT terminados en 0,1,2,3,4,5,6,7,8,9,K o k.
+  if (limpio.length < 8 || limpio.length > 9) return false;
 
   final cuerpo = limpio.substring(0, limpio.length - 1);
-  final dv = limpio.substring(limpio.length - 1);
-  if (!RegExp(r'^\d+$').hasMatch(cuerpo)) return false;
+  final dv = limpio.substring(limpio.length - 1).toUpperCase();
+
+  if (!RegExp(r'^\d{7,8}$').hasMatch(cuerpo)) return false;
   if (!RegExp(r'^[0-9K]$').hasMatch(dv)) return false;
 
-  int suma = 0;
-  int multiplicador = 2;
-
-  for (int i = cuerpo.length - 1; i >= 0; i--) {
-    suma += int.parse(cuerpo[i]) * multiplicador;
-    multiplicador++;
-    if (multiplicador > 7) multiplicador = 2;
-  }
-
-  final resto = 11 - (suma % 11);
-  final dvCalculado = resto == 11
-      ? '0'
-      : resto == 10
-      ? 'K'
-      : resto.toString();
-  return dv == dvCalculado;
+  return true;
 }
 
 bool validarTelefonoChile(String telefono) {
   final limpio = telefono.replaceAll(RegExp(r'[^0-9]'), '');
   return limpio.length == 9;
+}
+
+
+// Recarga los datos reales desde Supabase sin cerrar sesión.
+// Se usa desde los botones de actualizar de administrador, paciente y profesional.
+Future<void> cargarSesionActualDesdeSupabase() async {
+  final usuario = usuarioSesion;
+  final rol = rolSesion;
+  if (usuario == null || rol.isEmpty) return;
+
+  final supabase = Supabase.instance.client;
+  usuarioSesion = usuario;
+  rolSesion = rol;
+  pacienteSesion = null;
+  empleadoSesion = null;
+
+  pacientes.clear();
+  empleados.clear();
+  solicitudes.clear();
+  habitaciones.clear();
+  turnos.clear();
+  contactosEmergencia.clear();
+  historialPacientesInactivos.clear();
+
+  final habitacionesDb = await supabase
+      .from('habitacion')
+      .select('id_habitacion, nro_hab, piso, capacidad, estado');
+  for (final h in List<Map<String, dynamic>>.from(habitacionesDb)) {
+    habitaciones.add(
+      Habitacion(
+        idHabitacion: h['id_habitacion'] as int?,
+        numero: (h['nro_hab'] ?? '').toString(),
+        piso: 'Piso ${h['piso'] ?? ''}',
+        capacidad: h['capacidad'] ?? 1,
+        ocupantes: 0,
+        estado: (h['estado'] ?? 'Disponible').toString(),
+        paciente: 'Sin paciente',
+      ),
+    );
+  }
+
+  // IMPORTANTE: no se usa select('*, habitacion(...)') porque en la BD hay varias
+  // relaciones entre paciente, habitacion e hist_hab. Si se usa embed, Supabase
+  // lanza error PGRST201. Por eso se consulta paciente y habitación por separado.
+  final pacientesDb = await supabase.from('paciente').select();
+  for (final p in List<Map<String, dynamic>>.from(pacientesDb)) {
+    final nombreCompleto =
+    '${p['p_nombre'] ?? ''} ${p['s_nombre'] ?? ''} ${p['ap_paterno'] ?? ''} ${p['ap_materno'] ?? ''}'
+        .replaceAll(RegExp(r'\s+'), ' ')
+        .trim();
+
+    String textoHabitacion = 'Sin habitación';
+    final idHabitacion = p['id_habitacion'];
+    if (idHabitacion != null) {
+      final habitacionDb = await supabase
+          .from('habitacion')
+          .select('nro_hab')
+          .eq('id_habitacion', idHabitacion)
+          .maybeSingle();
+      if (habitacionDb != null) {
+        textoHabitacion = (habitacionDb['nro_hab'] ?? 'Sin habitación')
+            .toString();
+      }
+    }
+
+    final paciente = Paciente(
+      idPaciente: p['id_paciente'] as int?,
+      idUsuario: p['id_usuario'] as int?,
+      idHabitacion: p['id_habitacion'] as int?,
+      nombre: nombreCompleto,
+      rut: (p['rut_paciente'] ?? '').toString(),
+      telefono: (p['telefono'] ?? '').toString(),
+      correo: (usuario['correo'] ?? '').toString(),
+      direccion: (p['direccion'] ?? '').toString(),
+      fechaNacimiento:
+      DateTime.tryParse((p['fecha_nacimiento'] ?? '').toString()) ??
+          DateTime(1950, 1, 1),
+      habitacion: textoHabitacion,
+      fechaIngreso: (p['fecha_ingreso'] ?? '').toString(),
+      estado: (p['estado'] ?? 'Activo').toString(),
+      diagnostico: '',
+      alergias: '',
+      medicamentos: '',
+    );
+    pacientes.add(paciente);
+    if (p['id_usuario'] == usuario['id_usuario']) pacienteSesion = paciente;
+  }
+
+  await SeniorCareDb.cargarHistorialPacientesInactivosDesdeSupabase();
+
+  // Se consulta cargo aparte para evitar problemas similares de relaciones automáticas.
+  final empleadosDb = await supabase.from('empleado').select();
+  for (final e in List<Map<String, dynamic>>.from(empleadosDb)) {
+    final nombreCompleto =
+    '${e['p_nombre'] ?? ''} ${e['s_nombre'] ?? ''} ${e['ap_paterno'] ?? ''} ${e['ap_materno'] ?? ''}'
+        .replaceAll(RegExp(r'\s+'), ' ')
+        .trim();
+
+    String nombreCargo = 'Empleado';
+    final idCargo = e['id_cargo'];
+    if (idCargo != null) {
+      final cargoDb = await supabase
+          .from('cargo')
+          .select('nombre_cargo')
+          .eq('id_cargo', idCargo)
+          .maybeSingle();
+      if (cargoDb != null)
+        nombreCargo = (cargoDb['nombre_cargo'] ?? 'Empleado').toString();
+    }
+
+    final empleado = Empleado(
+      idEmpleado: e['id_empleado'] as int?,
+      idUsuario: e['id_usuario'] as int?,
+      idCargo: e['id_cargo'] as int?,
+      nombre: nombreCompleto,
+      rut: (e['rut_empleado'] ?? '').toString(),
+      cargo: nombreCargo,
+      telefono: (e['telefono'] ?? '').toString(),
+      estado: 'Activo',
+    );
+    empleados.add(empleado);
+    if (e['id_usuario'] == usuario['id_usuario']) empleadoSesion = empleado;
+  }
+
+  // Carga todos los contactos de emergencia desde Supabase.
+  // El paciente verá solo sus propios contactos por el filtro de la pantalla,
+  // mientras que el administrador podrá ver todos los contactos registrados.
+  final contactosDb = await supabase
+      .from('paciente_cont')
+      .select('id_paciente_cont, prioridad, id_cont_emer, id_paciente');
+  for (final c in List<Map<String, dynamic>>.from(contactosDb)) {
+    final idContacto = c['id_cont_emer'];
+    final idPacienteContacto = c['id_paciente'];
+    if (idContacto == null || idPacienteContacto == null) continue;
+
+    final pacienteRelacionado = pacientes
+        .where((p) => p.idPaciente == idPacienteContacto)
+        .toList();
+    final nombrePacienteContacto = pacienteRelacionado.isNotEmpty
+        ? pacienteRelacionado.first.nombre
+        : 'Paciente no cargado';
+
+    final ce = await supabase
+        .from('cont_emer')
+        .select(
+      'p_nombre, ap_paterno, ap_materno, telefono, correo, direccion',
+    )
+        .eq('id_cont_emer', idContacto)
+        .maybeSingle();
+    if (ce == null) continue;
+
+    contactosEmergencia.add(
+      ContactoEmergencia(
+        idContEmer: idContacto as int?,
+        idPacienteCont: c['id_paciente_cont'] as int?,
+        idPaciente: idPacienteContacto as int?,
+        paciente: nombrePacienteContacto,
+        nombre:
+        '${ce['p_nombre'] ?? ''} ${ce['ap_paterno'] ?? ''} ${ce['ap_materno'] ?? ''}'
+            .replaceAll(RegExp(r'\s+'), ' ')
+            .trim(),
+        telefono: (ce['telefono'] ?? '').toString(),
+        email: (ce['correo'] ?? '').toString(),
+        direccion: (ce['direccion'] ?? '').toString(),
+        prioridad: c['prioridad'] ?? 1,
+      ),
+    );
+  }
+
+  // Carga solicitudes reales desde Supabase sin relaciones embebidas.
+  final solicitudesDb = await supabase
+      .from('solicitud')
+      .select(
+    'id_solicitud, fecha_creacion, descripcion, id_tipo, id_paciente',
+  );
+  for (final sol in List<Map<String, dynamic>>.from(solicitudesDb)) {
+    final idPaciente = sol['id_paciente'];
+    final pacienteRelacionado = pacientes
+        .where((p) => p.idPaciente == idPaciente)
+        .toList();
+    final nombrePaciente = pacienteRelacionado.isNotEmpty
+        ? pacienteRelacionado.first.nombre
+        : 'Paciente no cargado';
+
+    String tipoNombre = 'Otro';
+    if (sol['id_tipo'] != null) {
+      final tipoDb = await supabase
+          .from('tipo_solicitud')
+          .select('nombre_tipo')
+          .eq('id_tipo', sol['id_tipo'])
+          .maybeSingle();
+      if (tipoDb != null)
+        tipoNombre = (tipoDb['nombre_tipo'] ?? 'Otro').toString();
+    }
+
+    String prioridadNombre = 'Media';
+    final priDb = await supabase
+        .from('sol_prioridad')
+        .select('id_prioridad')
+        .eq('id_solicitud', sol['id_solicitud'])
+        .order('fecha_cambio', ascending: false)
+        .limit(1)
+        .maybeSingle();
+    if (priDb != null && priDb['id_prioridad'] != null) {
+      final pDb = await supabase
+          .from('prioridad')
+          .select('tipo_prioridad')
+          .eq('id_prioridad', priDb['id_prioridad'])
+          .maybeSingle();
+      if (pDb != null)
+        prioridadNombre = (pDb['tipo_prioridad'] ?? 'Media').toString();
+    }
+
+    String estadoNombre = 'Creada';
+    String asignadoNombre = 'Sin asignar';
+    int? idAsignacion;
+    int? idEmpleadoAsignado;
+    String? horaAsignacion;
+    final asigDb = await supabase
+        .from('asignacion')
+        .select('id_asig, fecha_asignacion, id_empleado')
+        .eq('id_solicitud', sol['id_solicitud'])
+        .order('fecha_asignacion', ascending: false)
+        .limit(1)
+        .maybeSingle();
+    if (asigDb != null) {
+      idAsignacion = asigDb['id_asig'] as int?;
+      idEmpleadoAsignado = asigDb['id_empleado'] as int?;
+      final empleadoRelacionado = empleados
+          .where((e) => e.idEmpleado == idEmpleadoAsignado)
+          .toList();
+      if (empleadoRelacionado.isNotEmpty)
+        asignadoNombre = empleadoRelacionado.first.nombre;
+      final fechaAsig = DateTime.tryParse(
+        (asigDb['fecha_asignacion'] ?? '').toString(),
+      );
+      if (fechaAsig != null) horaAsignacion = formatDateTime(fechaAsig);
+      final estadoAsigDb = await supabase
+          .from('asig_estado')
+          .select('id_est_asig')
+          .eq('id_asig', idAsignacion ?? -1)
+          .order('fecha', ascending: false)
+          .limit(1)
+          .maybeSingle();
+      if (estadoAsigDb != null && estadoAsigDb['id_est_asig'] != null) {
+        final eDb = await supabase
+            .from('estado_asig')
+            .select('nombre')
+            .eq('id_est_asig', estadoAsigDb['id_est_asig'])
+            .maybeSingle();
+        if (eDb != null)
+          estadoNombre = (eDb['nombre'] ?? 'Asignada').toString();
+      } else {
+        estadoNombre = 'Asignada';
+      }
+    }
+
+    // Revisa el último estado real guardado por el profesional en historial_sol.
+    // La tabla solicitud no tiene columna estado, por eso el estado actual se recupera
+    // desde el último registro de historial_sol.
+    final histDb = await supabase
+        .from('historial_sol')
+        .select('id_est, fecha')
+        .eq('id_solicitud', sol['id_solicitud'])
+        .order('fecha', ascending: false)
+        .limit(1)
+        .maybeSingle();
+
+    if (histDb != null && histDb['id_est'] != null) {
+      final estadoDb = await supabase
+          .from('estado_sol')
+          .select('nombre_estado')
+          .eq('id_est', histDb['id_est'])
+          .maybeSingle();
+      if (estadoDb != null) {
+        estadoNombre = (estadoDb['nombre_estado'] ?? estadoNombre).toString();
+      }
+    }
+
+    final fechaCreacion = DateTime.tryParse(
+      (sol['fecha_creacion'] ?? '').toString(),
+    );
+    solicitudes.add(
+      Solicitud(
+        idSolicitud: sol['id_solicitud'] as int?,
+        idAsignacion: idAsignacion,
+        idEmpleadoAsignado: idEmpleadoAsignado,
+        titulo: 'Solicitud #${sol['id_solicitud']}',
+        descripcion: (sol['descripcion'] ?? '').toString(),
+        paciente: nombrePaciente,
+        tipo: tipoNombre,
+        fecha: fechaCreacion == null ? '' : formatDate(fechaCreacion),
+        estado: estadoNombre,
+        prioridad: prioridadNombre,
+        asignadoA: asignadoNombre,
+        horaCreacion: fechaCreacion == null
+            ? ''
+            : formatDateTime(fechaCreacion),
+        horaAsignacion: horaAsignacion,
+      ),
+    );
+  }
+
+  // Carga turnos reales desde Supabase.
+  final turnosDb = await supabase
+      .from('turno')
+      .select('id_turno, dia_semana, hora_inicio, hora_fin, id_empleado');
+  for (final t in List<Map<String, dynamic>>.from(turnosDb)) {
+    final idEmpleado = t['id_empleado'] as int?;
+    final empleadoRelacionado = empleados
+        .where((e) => e.idEmpleado == idEmpleado)
+        .toList();
+    final empleado = empleadoRelacionado.isNotEmpty
+        ? empleadoRelacionado.first
+        : null;
+    final diaTurno = (t['dia_semana'] ?? '').toString();
+    final esLibre = diaTurno.startsWith('Libre:');
+    turnos.add(
+      Turno(
+        idTurno: t['id_turno'] as int?,
+        idEmpleado: idEmpleado,
+        empleado: empleado?.nombre ?? 'Empleado no cargado',
+        cargo: empleado?.cargo ?? 'Sin cargo',
+        fecha: esLibre
+            ? diaTurno.replaceFirst('Libre:', '').trim()
+            : diaTurno,
+        horaInicio: esLibre
+            ? 'Libre'
+            : (t['hora_inicio'] ?? '').toString().substring(0, 5),
+        horaTermino: esLibre
+            ? 'Libre'
+            : (t['hora_fin'] ?? '').toString().substring(0, 5),
+        estado: esLibre ? 'Libre' : 'Asignado',
+      ),
+    );
+  }
+
+  await SeniorCareDb.cargarPermisosTemporalesDesdeSupabase();
+  eliminarDuplicadosSesionEnMemoria();
+
+  sincronizarHabitacionesConPacientes();
+
+}
+
+Future<void> refrescarSesionActual(BuildContext context, Widget homePage) async {
+  try {
+    await cargarSesionActualDesdeSupabase();
+    if (!context.mounted) return;
+    ScaffoldMessenger.of(context).showSnackBar(
+      const SnackBar(content: Text('Datos actualizados correctamente')),
+    );
+    Navigator.pushReplacement(
+      context,
+      MaterialPageRoute(builder: (_) => homePage),
+    );
+  } catch (e) {
+    if (!context.mounted) return;
+    ScaffoldMessenger.of(context).showSnackBar(
+      SnackBar(content: Text('Error al actualizar datos: $e'), backgroundColor: Colors.red),
+    );
+  }
 }
 
 // ============================================================
@@ -2250,6 +2910,9 @@ class _LoginPageState extends State<LoginPage> {
         ),
       );
     }
+
+    await SeniorCareDb.cargarPermisosTemporalesDesdeSupabase();
+    eliminarDuplicadosSesionEnMemoria();
 
     sincronizarHabitacionesConPacientes();
   }
@@ -3393,6 +4056,12 @@ class _PatientsPageState extends State<PatientsPage> {
                     paciente,
                     'Inactivo',
                   );
+                  await SeniorCareDb.registrarPacienteInactivo(
+                    paciente: paciente,
+                    motivo: motivo,
+                    descripcion: descripcion,
+                    responsable: 'Administrador',
+                  );
                 } catch (e) {
                   ScaffoldMessenger.of(context).showSnackBar(
                     SnackBar(
@@ -3457,34 +4126,43 @@ class _PatientsPageState extends State<PatientsPage> {
       );
       return;
     }
-    SeniorCareDb.actualizarEstadoPaciente(paciente, 'Activo')
-        .then((_) {
-      setState(() {
-        paciente.estado = 'Activo';
-        paciente.motivoInactividad = '';
-        paciente.descripcionInactividad = '';
-        paciente.fechaInactividad = '';
-      });
-      registrarHistorial(
-        'Paciente reactivado',
-        '${paciente.nombre} fue reactivado/a a las ${formatDateTime(DateTime.now())}. Debe asignarse habitación nuevamente.',
-      );
-      ScaffoldMessenger.of(context).showSnackBar(
-        const SnackBar(
-          content: Text(
-            'Paciente reactivado. Asigna una habitación cuando corresponda.',
+
+    () async {
+      try {
+        await SeniorCareDb.actualizarEstadoPaciente(paciente, 'Activo');
+        await SeniorCareDb.registrarPacienteReactivado(
+          paciente: paciente,
+          responsable: 'Administrador',
+        );
+
+        setState(() {
+          paciente.estado = 'Activo';
+          paciente.motivoInactividad = '';
+          paciente.descripcionInactividad = '';
+          paciente.fechaInactividad = '';
+        });
+
+        registrarHistorial(
+          'Paciente reactivado',
+          '${paciente.nombre} fue reactivado/a a las ${formatDateTime(DateTime.now())}. Debe asignarse habitación nuevamente.',
+        );
+
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(
+            content: Text(
+              'Paciente reactivado. Asigna una habitación cuando corresponda.',
+            ),
           ),
-        ),
-      );
-    })
-        .catchError((e) {
-      ScaffoldMessenger.of(context).showSnackBar(
-        SnackBar(
-          content: Text('Error al reactivar paciente: $e'),
-          backgroundColor: Colors.red,
-        ),
-      );
-    });
+        );
+      } catch (e) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(
+            content: Text('Error al reactivar paciente: $e'),
+            backgroundColor: Colors.red,
+          ),
+        );
+      }
+    }();
   }
 
   void asignarHabitacionPaciente(BuildContext context, Paciente paciente) {
@@ -4058,7 +4736,7 @@ class _RequestsPageState extends State<RequestsPage> {
                 if (s.horaFinalizacion != null)
                   infoRow('Finalizada el', s.horaFinalizacion!),
                 infoRow('Asignado a', s.asignadoA),
-                if (s.estado != 'Completada')
+                if (s.estado != 'Completada' && s.estado != 'Cancelada')
                   OutlinedButton.icon(
                     onPressed: () => asignarSolicitud(context, s),
                     icon: Icon(
@@ -4072,6 +4750,17 @@ class _RequestsPageState extends State<RequestsPage> {
                           : 'Asignar empleado',
                     ),
                   ),
+                if (s.estado != 'Completada' && s.estado != 'Cancelada')
+                  OutlinedButton.icon(
+                    onPressed: () => cancelarSolicitudAdmin(context, s),
+                    icon: const Icon(Icons.cancel_outlined, color: Colors.red),
+                    label: const Text('Cancelar solicitud', style: TextStyle(color: Colors.red)),
+                  ),
+                OutlinedButton.icon(
+                  onPressed: () => eliminarSolicitudAdmin(context, s),
+                  icon: const Icon(Icons.delete_outline, color: Colors.red),
+                  label: const Text('Eliminar solicitud', style: TextStyle(color: Colors.red)),
+                ),
               ],
             ),
           ),
@@ -4253,6 +4942,104 @@ class _RequestsPageState extends State<RequestsPage> {
       ),
     );
   }
+
+  void cancelarSolicitudAdmin(BuildContext context, Solicitud solicitud) {
+    final motivoController = TextEditingController();
+    showDialog(
+      context: context,
+      builder: (dialogContext) => AlertDialog(
+        title: const Text('Cancelar solicitud'),
+        content: TextField(
+          controller: motivoController,
+          maxLines: 4,
+          decoration: inputDecoration().copyWith(
+            labelText: 'Motivo de cancelación',
+          ),
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(dialogContext),
+            child: const Text('Volver'),
+          ),
+          FilledButton(
+            style: FilledButton.styleFrom(backgroundColor: Colors.red),
+            onPressed: () async {
+              final hora = formatDateTime(DateTime.now());
+              final motivo = motivoController.text.trim().isEmpty
+                  ? 'Cancelada por administrador sin motivo registrado.'
+                  : motivoController.text.trim();
+              try {
+                await SeniorCareDb.cancelarSolicitudAdmin(
+                  solicitud: solicitud,
+                  motivo: '${solicitud.titulo} fue cancelada por administrador a las $hora. Motivo: $motivo',
+                );
+                setState(() {
+                  solicitud.estado = 'Cancelada';
+                  solicitud.horaCancelacion = hora;
+                  solicitud.motivoCancelacion = motivo;
+                  solicitud.asignadoA = 'Sin asignar';
+                });
+                registrarHistorial(
+                  'Solicitud cancelada por administrador',
+                  '${solicitud.titulo} fue cancelada a las $hora. Motivo: $motivo',
+                );
+                Navigator.pop(dialogContext);
+                ScaffoldMessenger.of(context).showSnackBar(
+                  const SnackBar(content: Text('Solicitud cancelada correctamente')),
+                );
+              } catch (e) {
+                ScaffoldMessenger.of(context).showSnackBar(
+                  SnackBar(content: Text('Error al cancelar solicitud: $e'), backgroundColor: Colors.red),
+                );
+              }
+            },
+            child: const Text('Cancelar solicitud'),
+          ),
+        ],
+      ),
+    );
+  }
+
+  void eliminarSolicitudAdmin(BuildContext context, Solicitud solicitud) {
+    showDialog(
+      context: context,
+      builder: (dialogContext) => AlertDialog(
+        title: const Text('Eliminar solicitud'),
+        content: Text(
+          '¿Seguro que deseas eliminar ${solicitud.titulo}? Esta acción eliminará su asignación, prioridad e historial asociado en Supabase.',
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(dialogContext),
+            child: const Text('Volver'),
+          ),
+          FilledButton(
+            style: FilledButton.styleFrom(backgroundColor: Colors.red),
+            onPressed: () async {
+              try {
+                await SeniorCareDb.eliminarSolicitudCompleta(solicitud);
+                setState(() => solicitudes.remove(solicitud));
+                registrarHistorial(
+                  'Solicitud eliminada',
+                  '${solicitud.titulo} fue eliminada por administrador.',
+                );
+                Navigator.pop(dialogContext);
+                ScaffoldMessenger.of(context).showSnackBar(
+                  const SnackBar(content: Text('Solicitud eliminada correctamente')),
+                );
+              } catch (e) {
+                ScaffoldMessenger.of(context).showSnackBar(
+                  SnackBar(content: Text('Error al eliminar solicitud: $e'), backgroundColor: Colors.red),
+                );
+              }
+            },
+            child: const Text('Eliminar'),
+          ),
+        ],
+      ),
+    );
+  }
+
 }
 
 // Vista administrativa de habitaciones; permite asignar y mover pacientes entre habitaciones.
@@ -5011,7 +5798,7 @@ class _PermissionsPageState extends State<PermissionsPage> {
     return null;
   }
 
-  void guardarPermiso() {
+  Future<void> guardarPermiso() async {
     if (empleadoSeleccionado == null) {
       ScaffoldMessenger.of(context).showSnackBar(
         const SnackBar(
@@ -5023,6 +5810,7 @@ class _PermissionsPageState extends State<PermissionsPage> {
       );
       return;
     }
+
     final error = validarPermiso();
     if (error != null) {
       ScaffoldMessenger.of(context).showSnackBar(
@@ -5030,29 +5818,43 @@ class _PermissionsPageState extends State<PermissionsPage> {
       );
       return;
     }
-    setState(() {
-      permisosTemporales.add(
-        PermisoTemporal(
-          empleado: empleadoSeleccionado!,
-          permiso: permisoSeleccionado,
-          inicio: inicioPermiso,
-          termino: terminoPermisoEfectivo(),
-          estado: 'Activo',
-          horaOtorgado: formatDateTime(DateTime.now()),
+
+    final nuevoPermiso = PermisoTemporal(
+      empleado: empleadoSeleccionado!,
+      permiso: permisoSeleccionado,
+      inicio: inicioPermiso,
+      termino: terminoPermisoEfectivo(),
+      estado: 'Activo',
+      horaOtorgado: formatDateTime(DateTime.now()),
+    );
+
+    try {
+      nuevoPermiso.idPermiso = await SeniorCareDb.guardarPermisoTemporal(nuevoPermiso);
+
+      setState(() {
+        permisosTemporales.add(nuevoPermiso);
+        final empleado = empleados.firstWhere(
+              (e) => e.nombre == empleadoSeleccionado,
+        );
+        empleado.permisoAdminTemporal = nuevoPermiso.activoAhora;
+      });
+
+      registrarHistorial(
+        'Permiso temporal otorgado',
+        '${empleadoSeleccionado!} recibió permiso para: $permisoSeleccionado desde ${formatDate(inicioPermiso)} ${formatTime(inicioPermiso)} hasta ${formatDate(terminoPermisoEfectivo())} ${formatTime(terminoPermisoEfectivo())}.',
+      );
+
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(content: Text('Permiso guardado correctamente en Supabase')),
+      );
+    } catch (e) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(
+          content: Text('Error al guardar permiso en Supabase: $e'),
+          backgroundColor: Colors.red,
         ),
       );
-      final empleado = empleados.firstWhere(
-            (e) => e.nombre == empleadoSeleccionado,
-      );
-      empleado.permisoAdminTemporal = true;
-    });
-    registrarHistorial(
-      'Permiso temporal otorgado',
-      '${empleadoSeleccionado!} recibió permiso para: $permisoSeleccionado desde las ${formatTime(inicioPermiso)} hasta las ${formatTime(terminoPermiso)}${terminoPermisoEfectivo().day != inicioPermiso.day ? ' del día siguiente' : ''}. Fecha generada automáticamente: ${formatDate(DateTime.now())}.',
-    );
-    ScaffoldMessenger.of(context).showSnackBar(
-      const SnackBar(content: Text('Permiso otorgado correctamente')),
-    );
+    }
   }
 
   @override
@@ -5162,8 +5964,9 @@ class _PermissionsPageState extends State<PermissionsPage> {
               title: p.empleado,
               subtitle: p.permiso,
               children: [
-                infoRow('Fecha automática', formatDate(p.inicio)),
+                infoRow('Fecha inicio', formatDate(p.inicio)),
                 infoRow('Hora inicio', formatTime(p.inicio)),
+                infoRow('Fecha término', formatDate(p.termino)),
                 infoRow('Hora término', formatTime(p.termino)),
                 infoRow('Otorgado el', p.horaOtorgado),
                 if (p.horaRevocado != null)
@@ -5171,25 +5974,38 @@ class _PermissionsPageState extends State<PermissionsPage> {
                 statusChip(p.estado),
                 if (p.estado == 'Activo')
                   OutlinedButton.icon(
-                    onPressed: () {
+                    onPressed: () async {
                       final horaAccion = formatDateTime(DateTime.now());
-                      setState(() {
-                        p.estado = 'Revocado';
-                        p.horaRevocado = horaAccion;
-                        final tieneOtroActivo = permisosTemporales.any(
-                              (permiso) =>
-                          permiso.empleado == p.empleado &&
-                              permiso.estado == 'Activo',
+                      try {
+                        await SeniorCareDb.revocarPermisoTemporal(p);
+                        setState(() {
+                          p.estado = 'Revocado';
+                          p.horaRevocado = horaAccion;
+                          final tieneOtroActivo = permisosTemporales.any(
+                                (permiso) =>
+                            permiso.empleado == p.empleado &&
+                                permiso.activoAhora,
+                          );
+                          empleados
+                              .firstWhere((e) => e.nombre == p.empleado)
+                              .permisoAdminTemporal =
+                              tieneOtroActivo;
+                        });
+                        registrarHistorial(
+                          'Permiso revocado',
+                          'Se revocó el permiso "${p.permiso}" de ${p.empleado} a las $horaAccion.',
                         );
-                        empleados
-                            .firstWhere((e) => e.nombre == p.empleado)
-                            .permisoAdminTemporal =
-                            tieneOtroActivo;
-                      });
-                      registrarHistorial(
-                        'Permiso revocado',
-                        'Se revocó el permiso "${p.permiso}" de ${p.empleado} a las $horaAccion.',
-                      );
+                        ScaffoldMessenger.of(context).showSnackBar(
+                          const SnackBar(content: Text('Permiso revocado correctamente')),
+                        );
+                      } catch (e) {
+                        ScaffoldMessenger.of(context).showSnackBar(
+                          SnackBar(
+                            content: Text('Error al revocar permiso: $e'),
+                            backgroundColor: Colors.red,
+                          ),
+                        );
+                      }
                     },
                     icon: const Icon(Icons.block),
                     label: const Text('Revocar'),

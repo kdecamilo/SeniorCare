@@ -42,23 +42,8 @@ class _ProfessionalDashboardPageState extends State<ProfessionalDashboardPage> {
     final aceptadas = misSolicitudes
         .where((s) => s.estado == 'Aceptada' || s.estado == 'En Proceso')
         .length;
-    final misTurnosMap = <int, Turno>{};
-    final misTurnosSinId = <Turno>[];
-    for (final t in turnos.where((t) => t.empleado == profesionalActual)) {
-      if (t.idTurno != null) {
-        misTurnosMap[t.idTurno!] = t;
-      } else if (!misTurnosSinId.any((x) => x.fecha == t.fecha && x.horaInicio == t.horaInicio && x.horaTermino == t.horaTermino)) {
-        misTurnosSinId.add(t);
-      }
-    }
-    final misTurnos = [...misTurnosMap.values, ...misTurnosSinId];
-    final permisosActivos = permisosTemporales
-        .where(
-          (p) =>
-      p.empleado == profesionalActual &&
-          p.permiso == 'Asignar solicitudes' &&
-          p.activoAhora,
-    )
+    final misTurnos = turnos
+        .where((t) => t.empleado == profesionalActual)
         .toList();
 
     return ProfessionalLayout(
@@ -127,38 +112,6 @@ class _ProfessionalDashboardPageState extends State<ProfessionalDashboardPage> {
                   const SizedBox(height: 16),
                   ...misSolicitudes.map(
                         (s) => professionalMiniCard(context, s),
-                  ),
-                ],
-              ),
-            ),
-            const SizedBox(height: 24),
-          ],
-          if (permisosActivos.isNotEmpty) ...[
-            Container(
-              width: double.infinity,
-              padding: const EdgeInsets.all(20),
-              decoration: cardDecoration(),
-              child: Column(
-                crossAxisAlignment: CrossAxisAlignment.start,
-                children: [
-                  const Text(
-                    'Permiso temporal activo',
-                    style: TextStyle(fontSize: 18, fontWeight: FontWeight.bold),
-                  ),
-                  const SizedBox(height: 8),
-                  Text(
-                    'Puedes asignar solicitudes desde ${formatDate(permisosActivos.first.inicio)} ${formatTime(permisosActivos.first.inicio)} hasta ${formatDate(permisosActivos.first.termino)} ${formatTime(permisosActivos.first.termino)}.',
-                  ),
-                  const SizedBox(height: 14),
-                  FilledButton.icon(
-                    onPressed: () => Navigator.push(
-                      context,
-                      MaterialPageRoute(
-                        builder: (_) => const TemporaryAssignmentPage(),
-                      ),
-                    ),
-                    icon: const Icon(Icons.assignment_ind),
-                    label: const Text('Gestión temporal de solicitudes'),
                   ),
                 ],
               ),
@@ -1049,9 +1002,30 @@ class ProfessionalHistoryPage extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
-    final registros = historialProfesional
-        .where((h) => h.profesional == profesionalActual)
-        .toList();
+    final registrosMap = <String, HistorialProfesional>{};
+
+    for (final h in historialProfesional.where((h) => h.profesional == profesionalActual)) {
+      registrosMap['${h.solicitud}|${h.estadoFinal}|${h.fecha}|${h.detalle}'] = h;
+    }
+
+    for (final s in solicitudes.where((s) =>
+    s.asignadoA == profesionalActual &&
+        (normalizarEstadoSolicitud(s.estado) == 'completada' ||
+            normalizarEstadoSolicitud(s.estado) == 'finalizada' ||
+            normalizarEstadoSolicitud(s.estado) == 'cancelada' ||
+            normalizarEstadoSolicitud(s.estado) == 'reasignada'))) {
+      registrosMap['${s.titulo}|${s.estado}|${s.horaFinalizacion ?? s.horaCancelacion ?? s.horaReasignacion ?? s.horaAsignacion ?? s.horaCreacion}'] = HistorialProfesional(
+        profesional: profesionalActual,
+        solicitud: s.titulo,
+        paciente: s.paciente,
+        tipo: s.tipo,
+        estadoFinal: s.estado,
+        detalle: s.motivoCancelacion ?? s.motivoReasignacion ?? s.descripcion,
+        fecha: s.horaFinalizacion ?? s.horaCancelacion ?? s.horaReasignacion ?? s.horaAsignacion ?? s.horaCreacion,
+      );
+    }
+
+    final registros = registrosMap.values.toList();
 
     return ProfessionalLayout(
       title: 'Historial de Solicitudes',
@@ -1087,212 +1061,36 @@ class ProfessionalHistoryPage extends StatelessWidget {
 }
 
 
-// Vista temporal que permite asignar o reasignar solicitudes cuando el empleado tiene permiso activo.
-class TemporaryAssignmentPage extends StatefulWidget {
-  const TemporaryAssignmentPage({super.key});
-
-  @override
-  State<TemporaryAssignmentPage> createState() => _TemporaryAssignmentPageState();
+Widget paginaProfesionalActualPorTitulo(String title) {
+  switch (title) {
+    case 'Panel Profesional':
+      return const ProfessionalDashboardPage();
+    case 'Mis Tareas':
+      return const ProfessionalTasksPage();
+    case 'Historial de Solicitudes':
+      return const ProfessionalHistoryPage();
+    case 'Gestión temporal de solicitudes':
+      return const TemporaryRequestManagementPage();
+    default:
+      return const ProfessionalDashboardPage();
+  }
 }
 
-class _TemporaryAssignmentPageState extends State<TemporaryAssignmentPage> {
-  @override
-  Widget build(BuildContext context) {
-    final permisosActivos = permisosTemporales
-        .where(
-          (p) =>
-      p.empleado == profesionalActual &&
-          p.permiso == 'Asignar solicitudes' &&
-          p.activoAhora,
-    )
-        .toList();
-
-    final solicitudesDisponiblesMap = <int, Solicitud>{};
-    final solicitudesDisponiblesSinId = <Solicitud>[];
-    for (final s in solicitudes.where((s) => s.estado != 'Completada' && s.estado != 'Cancelada')) {
-      if (s.idSolicitud != null) {
-        solicitudesDisponiblesMap[s.idSolicitud!] = s;
-      } else if (!solicitudesDisponiblesSinId.any((x) => x.titulo == s.titulo && x.paciente == s.paciente && x.horaCreacion == s.horaCreacion)) {
-        solicitudesDisponiblesSinId.add(s);
-      }
-    }
-    final solicitudesDisponibles = [
-      ...solicitudesDisponiblesMap.values,
-      ...solicitudesDisponiblesSinId,
-    ];
-
-    return ProfessionalLayout(
-      title: 'Gestión temporal de solicitudes',
-      subtitle: 'Permiso temporal para asignar o reasignar solicitudes',
-      child: Column(
-        children: [
-          if (permisosActivos.isEmpty)
-            Container(
-              width: double.infinity,
-              padding: const EdgeInsets.all(24),
-              decoration: cardDecoration(),
-              child: const Text(
-                'No tienes un permiso temporal activo para asignar solicitudes.',
-              ),
-            ),
-          if (permisosActivos.isNotEmpty)
-            Container(
-              width: double.infinity,
-              padding: const EdgeInsets.all(18),
-              margin: const EdgeInsets.only(bottom: 18),
-              decoration: cardDecoration(),
-              child: Text(
-                'Permiso activo hasta ${formatDate(permisosActivos.first.termino)} ${formatTime(permisosActivos.first.termino)}.',
-              ),
-            ),
-          if (permisosActivos.isNotEmpty && solicitudesDisponibles.isEmpty)
-            Container(
-              width: double.infinity,
-              padding: const EdgeInsets.all(24),
-              decoration: cardDecoration(),
-              child: const Text('No existen solicitudes disponibles.'),
-            ),
-          if (permisosActivos.isNotEmpty)
-            ...solicitudesDisponibles.map(
-                  (s) => listCard(
-                title: s.titulo,
-                subtitle: s.descripcion,
-                children: [
-                  statusChip(s.estado),
-                  statusChip(s.prioridad),
-                  infoRow('Paciente', s.paciente),
-                  infoRow('Tipo', s.tipo),
-                  infoRow('Asignado a', s.asignadoA),
-                  OutlinedButton.icon(
-                    onPressed: () => asignarDesdePermiso(context, s),
-                    icon: const Icon(Icons.assignment_ind),
-                    label: Text(
-                      s.asignadoA == 'Sin asignar'
-                          ? 'Asignar empleado'
-                          : 'Reasignar empleado',
-                    ),
-                  ),
-                ],
-              ),
-            ),
-        ],
-      ),
+Future<void> refrescarVistaProfesional(BuildContext context, String title) async {
+  try {
+    await cargarSesionActualDesdeSupabase();
+    if (!context.mounted) return;
+    ScaffoldMessenger.of(context).showSnackBar(
+      const SnackBar(content: Text('Datos actualizados correctamente')),
     );
-  }
-
-  void asignarDesdePermiso(BuildContext context, Solicitud solicitud) {
-    if (empleados.isEmpty) {
-      ScaffoldMessenger.of(context).showSnackBar(
-        const SnackBar(
-          content: Text('No existen empleados disponibles.'),
-          backgroundColor: Colors.red,
-        ),
-      );
-      return;
-    }
-
-    String empleadoSeleccionado = solicitud.asignadoA != 'Sin asignar'
-        ? solicitud.asignadoA
-        : empleados.first.nombre;
-
-    final descripcionController = TextEditingController(
-      text: 'Asignación realizada por permiso temporal de $profesionalActual.',
+    Navigator.pushReplacement(
+      context,
+      MaterialPageRoute(builder: (_) => paginaProfesionalActualPorTitulo(title)),
     );
-
-    showDialog(
-      context: context,
-      builder: (dialogContext) => StatefulBuilder(
-        builder: (context, setDialogState) => AlertDialog(
-          title: const Text('Asignar solicitud'),
-          content: Column(
-            mainAxisSize: MainAxisSize.min,
-            children: [
-              DropdownButtonFormField<String>(
-                value: empleadoSeleccionado,
-                decoration: inputDecoration().copyWith(
-                  labelText: 'Empleado responsable',
-                ),
-                items: empleados
-                    .map(
-                      (e) => DropdownMenuItem(
-                    value: e.nombre,
-                    child: Text('${e.nombre} - ${e.cargo}'),
-                  ),
-                )
-                    .toList(),
-                onChanged: (value) =>
-                    setDialogState(() => empleadoSeleccionado = value!),
-              ),
-              const SizedBox(height: 14),
-              TextField(
-                controller: descripcionController,
-                maxLines: 3,
-                decoration: inputDecoration().copyWith(
-                  labelText: 'Descripción',
-                ),
-              ),
-            ],
-          ),
-          actions: [
-            TextButton(
-              onPressed: () => Navigator.pop(dialogContext),
-              child: const Text('Cancelar'),
-            ),
-            FilledButton(
-              onPressed: () async {
-                try {
-                  final eraReasignacion = solicitud.asignadoA != 'Sin asignar';
-
-                  final idEmpleado = await SeniorCareDb.asignarSolicitud(
-                    solicitud: solicitud,
-                    empleadoNombre: empleadoSeleccionado,
-                    reasignar: eraReasignacion,
-                    descripcion: descripcionController.text.trim(),
-                  );
-
-                  if (idEmpleado == null) {
-                    throw Exception('No se pudo obtener el empleado.');
-                  }
-
-                  setState(() {
-                    solicitud.idEmpleadoAsignado = idEmpleado;
-                    solicitud.asignadoA = empleadoSeleccionado;
-                    solicitud.estado = eraReasignacion ? 'Reasignada' : 'Asignada';
-                    if (eraReasignacion) {
-                      solicitud.horaReasignacion = formatDateTime(DateTime.now());
-                    } else {
-                      solicitud.horaAsignacion = formatDateTime(DateTime.now());
-                    }
-                  });
-
-                  registrarHistorial(
-                    eraReasignacion
-                        ? 'Reasignación por permiso temporal'
-                        : 'Asignación por permiso temporal',
-                    '${solicitud.titulo} fue asignada a $empleadoSeleccionado por $profesionalActual usando permiso temporal.',
-                  );
-
-                  Navigator.pop(dialogContext);
-
-                  ScaffoldMessenger.of(context).showSnackBar(
-                    const SnackBar(
-                      content: Text('Solicitud asignada correctamente'),
-                    ),
-                  );
-                } catch (e) {
-                  ScaffoldMessenger.of(context).showSnackBar(
-                    SnackBar(
-                      content: Text('Error al asignar solicitud: $e'),
-                      backgroundColor: Colors.red,
-                    ),
-                  );
-                }
-              },
-              child: const Text('Guardar'),
-            ),
-          ],
-        ),
-      ),
+  } catch (e) {
+    if (!context.mounted) return;
+    ScaffoldMessenger.of(context).showSnackBar(
+      SnackBar(content: Text('Error al actualizar datos: $e'), backgroundColor: Colors.red),
     );
   }
 }
@@ -1347,7 +1145,7 @@ class ProfessionalLayout extends StatelessWidget {
           ),
           IconButton(
             tooltip: 'Actualizar',
-            onPressed: () => refrescarSesionActual(context, const ProfessionalDashboardPage()),
+            onPressed: () => refrescarVistaProfesional(context, title),
             icon: const Icon(Icons.refresh),
           ),
           IconButton(

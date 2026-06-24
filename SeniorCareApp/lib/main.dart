@@ -734,54 +734,347 @@ class SeniorCareDb {
   static Future<void> cargarHistorialPacientesInactivosDesdeSupabase() async {
     historialPacientesInactivos.clear();
 
+    // Solo se debe mostrar el último registro de inactivación de cada paciente
+    // que actualmente siga en estado Inactivo. Si el paciente fue reactivado,
+    // no debe aparecer en esta vista. Esto evita duplicados al presionar Actualizar.
     final data = await db
         .from('historial_paciente_inactivo')
         .select('id_historial, id_paciente, motivo, descripcion, fecha, responsable, estado_accion')
+        .ilike('estado_accion', 'Inactivo')
         .order('fecha', ascending: false);
 
-    final ultimoInactivoPorPaciente = <int, Map<String, dynamic>>{};
+    final ultimoPorPaciente = <int, Map<String, dynamic>>{};
 
     for (final h in List<Map<String, dynamic>>.from(data)) {
-      final accion = (h['estado_accion'] ?? 'Inactivo').toString();
       final idPaciente = h['id_paciente'] as int?;
       if (idPaciente == null) continue;
 
-      final pacienteRelacionado = pacientes.where((p) => p.idPaciente == idPaciente).toList();
-      if (pacienteRelacionado.isEmpty) continue;
+      final pacienteLocal = pacientes.where((p) => p.idPaciente == idPaciente).toList();
+      if (pacienteLocal.isEmpty) continue;
+
+      final paciente = pacienteLocal.first;
+      if (paciente.estado.toLowerCase() != 'inactivo') continue;
+
+      // La consulta viene ordenada por fecha descendente. El primer registro
+      // encontrado por paciente es el último real y se conserva solo ese.
+      ultimoPorPaciente.putIfAbsent(idPaciente, () => h);
+    }
+
+    final registrosOrdenados = ultimoPorPaciente.entries.toList()
+      ..sort((a, b) {
+        final fa = DateTime.tryParse((a.value['fecha'] ?? '').toString()) ?? DateTime(1900);
+        final fb = DateTime.tryParse((b.value['fecha'] ?? '').toString()) ?? DateTime(1900);
+        return fb.compareTo(fa);
+      });
+
+    for (final entry in registrosOrdenados) {
+      final idPaciente = entry.key;
+      final h = entry.value;
+      final paciente = pacientes.firstWhere((p) => p.idPaciente == idPaciente);
 
       final fechaDb = DateTime.tryParse((h['fecha'] ?? '').toString());
       final fechaTexto = fechaDb == null ? '' : formatDateTime(fechaDb.toLocal());
 
-      if (accion == 'Inactivo') {
-        final registro = HistorialPacienteInactivo(
-          paciente: pacienteRelacionado.first.nombre,
-          motivo: (h['motivo'] ?? '').toString(),
-          descripcion: (h['descripcion'] ?? '').toString(),
+      paciente.motivoInactividad = (h['motivo'] ?? '').toString();
+      paciente.descripcionInactividad = (h['descripcion'] ?? '').toString();
+      paciente.fechaInactividad = fechaTexto;
+
+      historialPacientesInactivos.add(
+        HistorialPacienteInactivo(
+          paciente: paciente.nombre,
+          motivo: paciente.motivoInactividad,
+          descripcion: paciente.descripcionInactividad,
           fecha: fechaTexto,
           responsable: (h['responsable'] ?? 'Administrador').toString(),
-        );
+        ),
+      );
+    }
+  }
 
-        historialPacientesInactivos.add(registro);
-        ultimoInactivoPorPaciente.putIfAbsent(idPaciente, () => h);
+
+  static Future<void> cargarHistorialProfesionalDesdeSupabase() async {
+    historialProfesional.clear();
+
+    final historialSolicitudes = await db
+        .from('historial_sol')
+        .select('id_historial, descripcion_hist, fecha, id_solicitud, id_est, id_empleado')
+        .order('fecha', ascending: false);
+
+    final registrosUnicos = <String, HistorialProfesional>{};
+
+    for (final h in List<Map<String, dynamic>>.from(historialSolicitudes)) {
+      final idEmpleado = h['id_empleado'] as int?;
+      if (idEmpleado == null) continue;
+
+      String nombreProfesional = 'Profesional no cargado';
+      final empleadoLocal = empleados.where((e) => e.idEmpleado == idEmpleado).toList();
+      if (empleadoLocal.isNotEmpty) {
+        nombreProfesional = empleadoLocal.first.nombre;
+      } else {
+        final empleadoDb = await db
+            .from('empleado')
+            .select('p_nombre, s_nombre, ap_paterno, ap_materno')
+            .eq('id_empleado', idEmpleado)
+            .maybeSingle();
+        if (empleadoDb != null) {
+          nombreProfesional = '${empleadoDb['p_nombre'] ?? ''} ${empleadoDb['s_nombre'] ?? ''} ${empleadoDb['ap_paterno'] ?? ''} ${empleadoDb['ap_materno'] ?? ''}'
+              .replaceAll(RegExp(r'\s+'), ' ')
+              .trim();
+        }
       }
+
+      final idSolicitud = h['id_solicitud'] as int?;
+      String solicitudTexto = idSolicitud == null ? 'Solicitud' : 'Solicitud #$idSolicitud';
+      String pacienteTexto = 'Paciente no cargado';
+      String tipoTexto = 'Sin tipo';
+
+      final solicitudLocal = solicitudes.where((s) => s.idSolicitud == idSolicitud).toList();
+      if (solicitudLocal.isNotEmpty) {
+        solicitudTexto = solicitudLocal.first.titulo;
+        pacienteTexto = solicitudLocal.first.paciente;
+        tipoTexto = solicitudLocal.first.tipo;
+      } else if (idSolicitud != null) {
+        final solicitudDb = await db
+            .from('solicitud')
+            .select('descripcion, id_tipo, id_paciente')
+            .eq('id_solicitud', idSolicitud)
+            .maybeSingle();
+        if (solicitudDb != null) {
+          final idTipo = solicitudDb['id_tipo'];
+          if (idTipo != null) {
+            final tipoDb = await db
+                .from('tipo_solicitud')
+                .select('nombre_tipo')
+                .eq('id_tipo', idTipo)
+                .maybeSingle();
+            if (tipoDb != null) tipoTexto = (tipoDb['nombre_tipo'] ?? tipoTexto).toString();
+          }
+          final idPaciente = solicitudDb['id_paciente'];
+          if (idPaciente != null) {
+            final pacienteLocal = pacientes.where((p) => p.idPaciente == idPaciente).toList();
+            if (pacienteLocal.isNotEmpty) {
+              pacienteTexto = pacienteLocal.first.nombre;
+            } else {
+              final pacienteDb = await db
+                  .from('paciente')
+                  .select('p_nombre, s_nombre, ap_paterno, ap_materno')
+                  .eq('id_paciente', idPaciente)
+                  .maybeSingle();
+              if (pacienteDb != null) {
+                pacienteTexto = '${pacienteDb['p_nombre'] ?? ''} ${pacienteDb['s_nombre'] ?? ''} ${pacienteDb['ap_paterno'] ?? ''} ${pacienteDb['ap_materno'] ?? ''}'
+                    .replaceAll(RegExp(r'\s+'), ' ')
+                    .trim();
+              }
+            }
+          }
+        }
+      }
+
+      String estadoTexto = 'Acción registrada';
+      final idEstado = h['id_est'];
+      if (idEstado != null) {
+        final estadoDb = await db
+            .from('estado_sol')
+            .select('nombre_estado')
+            .eq('id_est', idEstado)
+            .maybeSingle();
+        if (estadoDb != null) estadoTexto = (estadoDb['nombre_estado'] ?? estadoTexto).toString();
+      }
+
+      final fechaDb = DateTime.tryParse((h['fecha'] ?? '').toString());
+      final fechaTexto = fechaDb == null ? '' : formatDateTime(fechaDb.toLocal());
+      final detalleTexto = (h['descripcion_hist'] ?? '').toString().trim();
+
+      registrosUnicos['$nombreProfesional|$solicitudTexto|$estadoTexto|$fechaTexto|$detalleTexto'] = HistorialProfesional(
+        profesional: nombreProfesional,
+        solicitud: solicitudTexto,
+        paciente: pacienteTexto,
+        tipo: tipoTexto,
+        estadoFinal: estadoTexto,
+        detalle: detalleTexto.isEmpty ? 'Acción registrada en la solicitud.' : detalleTexto,
+        fecha: fechaTexto,
+      );
     }
 
-    for (final paciente in pacientes) {
-      if (paciente.estado != 'Inactivo' || paciente.idPaciente == null) {
-        paciente.motivoInactividad = '';
-        paciente.descripcionInactividad = '';
-        paciente.fechaInactividad = '';
-        continue;
+    historialProfesional
+      ..clear()
+      ..addAll(registrosUnicos.values);
+  }
+
+  static Future<void> cargarHistorialAdminDesdeSupabase() async {
+    historialAdmin.clear();
+
+    final registros = <HistorialAdmin>[];
+
+    // Acciones administrativas guardadas directamente en Supabase.
+    final historialAccionesAdmin = await db
+        .from('historial_admin_accion')
+        .select('accion, detalle, responsable, fecha')
+        .order('fecha', ascending: false);
+
+    for (final h in List<Map<String, dynamic>>.from(historialAccionesAdmin)) {
+      final fechaDb = DateTime.tryParse((h['fecha'] ?? '').toString());
+      registros.add(
+        HistorialAdmin(
+          accion: (h['accion'] ?? 'Acción administrativa').toString(),
+          detalle: (h['detalle'] ?? '').toString(),
+          fecha: fechaDb == null ? '' : formatDateTime(fechaDb.toLocal()),
+          responsable: (h['responsable'] ?? 'Administrador').toString(),
+        ),
+      );
+    }
+
+    // Acciones de solicitudes realizadas por profesionales o desde gestión temporal.
+    final historialSolicitudes = await db
+        .from('historial_sol')
+        .select('id_historial, descripcion_hist, fecha, id_solicitud, id_est, id_empleado')
+        .order('fecha', ascending: false);
+
+    for (final h in List<Map<String, dynamic>>.from(historialSolicitudes)) {
+      String estado = 'Acción de solicitud';
+      final idEstado = h['id_est'];
+      if (idEstado != null) {
+        final estadoDb = await db
+            .from('estado_sol')
+            .select('nombre_estado')
+            .eq('id_est', idEstado)
+            .maybeSingle();
+        if (estadoDb != null) {
+          estado = (estadoDb['nombre_estado'] ?? estado).toString();
+        }
       }
 
-      final ultimo = ultimoInactivoPorPaciente[paciente.idPaciente!];
-      if (ultimo == null) continue;
+      String responsable = 'Sistema';
+      final idEmpleado = h['id_empleado'];
+      if (idEmpleado != null) {
+        final empleadoLocal = empleados.where((e) => e.idEmpleado == idEmpleado).toList();
+        if (empleadoLocal.isNotEmpty) {
+          responsable = empleadoLocal.first.nombre;
+        } else {
+          final empleadoDb = await db
+              .from('empleado')
+              .select('p_nombre, s_nombre, ap_paterno, ap_materno')
+              .eq('id_empleado', idEmpleado)
+              .maybeSingle();
+          if (empleadoDb != null) {
+            responsable = '${empleadoDb['p_nombre'] ?? ''} ${empleadoDb['s_nombre'] ?? ''} ${empleadoDb['ap_paterno'] ?? ''} ${empleadoDb['ap_materno'] ?? ''}'
+                .replaceAll(RegExp(r'\s+'), ' ')
+                .trim();
+          }
+        }
+      }
 
-      final fechaDb = DateTime.tryParse((ultimo['fecha'] ?? '').toString());
-      paciente.motivoInactividad = (ultimo['motivo'] ?? '').toString();
-      paciente.descripcionInactividad = (ultimo['descripcion'] ?? '').toString();
-      paciente.fechaInactividad = fechaDb == null ? '' : formatDateTime(fechaDb.toLocal());
+      final fechaDb = DateTime.tryParse((h['fecha'] ?? '').toString());
+      registros.add(
+        HistorialAdmin(
+          accion: 'Solicitud $estado',
+          detalle: (h['descripcion_hist'] ?? '').toString(),
+          fecha: fechaDb == null ? '' : formatDateTime(fechaDb.toLocal()),
+          responsable: responsable.isEmpty ? 'Sistema' : responsable,
+        ),
+      );
     }
+
+    // Asignaciones y reasignaciones realizadas por administrador o por permisos temporales.
+    final historialAsignaciones = await db
+        .from('asig_estado')
+        .select('id_est_asig, id_asig, fecha')
+        .order('fecha', ascending: false);
+
+    for (final h in List<Map<String, dynamic>>.from(historialAsignaciones)) {
+      final idAsig = h['id_asig'];
+      if (idAsig == null) continue;
+
+      String estado = 'Asignación';
+      final idEstadoAsig = h['id_est_asig'];
+      if (idEstadoAsig != null) {
+        final estadoDb = await db
+            .from('estado_asig')
+            .select('nombre')
+            .eq('id_est_asig', idEstadoAsig)
+            .maybeSingle();
+        if (estadoDb != null) {
+          estado = (estadoDb['nombre'] ?? estado).toString();
+        }
+      }
+
+      final asigDb = await db
+          .from('asignacion')
+          .select('descripcion, id_solicitud, id_empleado')
+          .eq('id_asig', idAsig)
+          .maybeSingle();
+      if (asigDb == null) continue;
+
+      String empleadoNombre = 'Empleado no cargado';
+      final idEmpleado = asigDb['id_empleado'];
+      if (idEmpleado != null) {
+        final empleadoLocal = empleados.where((e) => e.idEmpleado == idEmpleado).toList();
+        if (empleadoLocal.isNotEmpty) {
+          empleadoNombre = empleadoLocal.first.nombre;
+        }
+      }
+
+      final idSolicitud = asigDb['id_solicitud'];
+      String solicitudTexto = idSolicitud == null ? 'Solicitud' : 'Solicitud #$idSolicitud';
+      final solicitudLocal = solicitudes.where((s) => s.idSolicitud == idSolicitud).toList();
+      if (solicitudLocal.isNotEmpty) {
+        solicitudTexto = solicitudLocal.first.titulo;
+      }
+
+      final fechaDb = DateTime.tryParse((h['fecha'] ?? '').toString());
+      registros.add(
+        HistorialAdmin(
+          accion: 'Solicitud $estado',
+          detalle: '$solicitudTexto fue asignada a $empleadoNombre. ${(asigDb['descripcion'] ?? '').toString()}'.trim(),
+          fecha: fechaDb == null ? '' : formatDateTime(fechaDb.toLocal()),
+          responsable: 'Administrador / permiso temporal',
+        ),
+      );
+    }
+
+    // Historial de pacientes inactivos o reactivados realizado por administración.
+    final historialPacientes = await db
+        .from('historial_paciente_inactivo')
+        .select('id_historial, id_paciente, motivo, descripcion, fecha, responsable, estado_accion')
+        .order('fecha', ascending: false);
+
+    for (final h in List<Map<String, dynamic>>.from(historialPacientes)) {
+      final idPaciente = h['id_paciente'] as int?;
+      String nombrePaciente = 'Paciente no cargado';
+      if (idPaciente != null) {
+        final pacienteLocal = pacientes.where((p) => p.idPaciente == idPaciente).toList();
+        if (pacienteLocal.isNotEmpty) {
+          nombrePaciente = pacienteLocal.first.nombre;
+        } else {
+          final pacienteDb = await db
+              .from('paciente')
+              .select('p_nombre, s_nombre, ap_paterno, ap_materno')
+              .eq('id_paciente', idPaciente)
+              .maybeSingle();
+          if (pacienteDb != null) {
+            nombrePaciente = '${pacienteDb['p_nombre'] ?? ''} ${pacienteDb['s_nombre'] ?? ''} ${pacienteDb['ap_paterno'] ?? ''} ${pacienteDb['ap_materno'] ?? ''}'
+                .replaceAll(RegExp(r'\s+'), ' ')
+                .trim();
+          }
+        }
+      }
+
+      final accion = (h['estado_accion'] ?? 'Inactivo').toString();
+      final fechaDb = DateTime.tryParse((h['fecha'] ?? '').toString());
+      registros.add(
+        HistorialAdmin(
+          accion: accion == 'Reactivado' ? 'Paciente reactivado' : 'Paciente inactivo',
+          detalle: '$nombrePaciente - ${h['motivo'] ?? ''}. ${h['descripcion'] ?? ''}'.trim(),
+          fecha: fechaDb == null ? '' : formatDateTime(fechaDb.toLocal()),
+          responsable: (h['responsable'] ?? 'Administrador').toString(),
+        ),
+      );
+    }
+
+    registros.sort((a, b) => b.fecha.compareTo(a.fecha));
+    historialAdmin
+      ..clear()
+      ..addAll(registros);
   }
 
   static Future<int?> crearTurno(Turno turno) async {
@@ -1100,15 +1393,24 @@ DateTime combineDateAndTime(DateTime date, TimeOfDay time) {
 
 // Registra una acción administrativa con fecha y hora para mantener trazabilidad.
 void registrarHistorial(String accion, String detalle) {
+  final ahora = DateTime.now();
+
   historialAdmin.insert(
     0,
     HistorialAdmin(
       accion: accion,
       detalle: detalle,
-      fecha: formatDateTime(DateTime.now()),
+      fecha: formatDateTime(ahora),
       responsable: 'Administrador',
     ),
   );
+
+  Supabase.instance.client.from('historial_admin_accion').insert({
+    'accion': accion,
+    'detalle': detalle,
+    'responsable': 'Administrador',
+    'fecha': ahora.toIso8601String(),
+  }).catchError((_) {});
 }
 
 // Registra una acción administrativa con fecha y hora para mantener trazabilidad.
@@ -1436,6 +1738,8 @@ Future<void> cargarSesionActualDesdeSupabase() async {
   turnos.clear();
   contactosEmergencia.clear();
   historialPacientesInactivos.clear();
+  historialAdmin.clear();
+  historialProfesional.clear();
 
   final habitacionesDb = await supabase
       .from('habitacion')
@@ -1751,6 +2055,8 @@ Future<void> cargarSesionActualDesdeSupabase() async {
   }
 
   await SeniorCareDb.cargarPermisosTemporalesDesdeSupabase();
+  await SeniorCareDb.cargarHistorialProfesionalDesdeSupabase();
+  await SeniorCareDb.cargarHistorialAdminDesdeSupabase();
   eliminarDuplicadosSesionEnMemoria();
 
   sincronizarHabitacionesConPacientes();
@@ -2599,6 +2905,9 @@ class _LoginPageState extends State<LoginPage> {
     habitaciones.clear();
     turnos.clear();
     contactosEmergencia.clear();
+    historialPacientesInactivos.clear();
+    historialAdmin.clear();
+    historialProfesional.clear();
 
     final habitacionesDb = await supabase
         .from('habitacion')
@@ -2912,6 +3221,8 @@ class _LoginPageState extends State<LoginPage> {
     }
 
     await SeniorCareDb.cargarPermisosTemporalesDesdeSupabase();
+    await SeniorCareDb.cargarHistorialProfesionalDesdeSupabase();
+    await SeniorCareDb.cargarHistorialAdminDesdeSupabase();
     eliminarDuplicadosSesionEnMemoria();
 
     sincronizarHabitacionesConPacientes();
@@ -4259,23 +4570,9 @@ class InactivePatientsHistoryPage extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
-    final registrosMap = <String, HistorialPacienteInactivo>{};
-    for (final h in historialPacientesInactivos) {
-      registrosMap['${h.paciente}|${h.motivo}|${h.fecha}'] = h;
-    }
-    for (final p in pacientes.where(
-          (p) => p.estado == 'Inactivo' && p.fechaInactividad.isNotEmpty,
-    )) {
-      final h = HistorialPacienteInactivo(
-        paciente: p.nombre,
-        motivo: p.motivoInactividad,
-        descripcion: p.descripcionInactividad,
-        fecha: p.fechaInactividad,
-        responsable: 'Administrador',
-      );
-      registrosMap['${h.paciente}|${h.motivo}|${h.fecha}'] = h;
-    }
-    final registros = registrosMap.values.toList();
+    // Esta lista ya viene depurada desde Supabase: un solo registro por paciente
+    // actualmente inactivo. No se mezcla con otros registros locales para evitar duplicados.
+    final registros = historialPacientesInactivos;
 
     return AdminLayout(
       title: 'Historial de Pacientes Inactivos',
@@ -4713,7 +5010,12 @@ class _RequestsPageState extends State<RequestsPage> {
           filterBoxEstado(),
           const SizedBox(height: 20),
           ...solicitudes
-              .where((s) => filtroEstado == 'Todos' || s.estado == filtroEstado)
+              .where((s) {
+            if (filtroEstado == 'Todos') {
+              return s.estado != 'Completada' && s.estado != 'Cancelada';
+            }
+            return s.estado == filtroEstado;
+          })
               .map(
                 (s) => listCard(
               title: s.titulo,
@@ -5312,10 +5614,6 @@ class _ShiftsPageState extends State<ShiftsPage> {
                 else ...[
                   infoRow('Hora inicio', t.horaInicio),
                   infoRow('Hora término', t.horaTermino),
-                  infoRow(
-                    'Duración',
-                    '${calcularDuracionHoras(t.horaInicio, t.horaTermino).toStringAsFixed(1)} horas',
-                  ),
                   statusChip(t.estado),
                 ],
                 if (t.estado != 'Libre')
@@ -6112,6 +6410,68 @@ class PatientLayout extends StatelessWidget {
   }
 }
 
+// Devuelve la misma vista luego de presionar Actualizar.
+// Así el usuario no vuelve al panel principal al refrescar datos desde Supabase.
+Widget paginaActualPorRolYTitulo(String role, String title, Widget homePage) {
+  if (role == 'Administrador') {
+    switch (title) {
+      case 'Panel Administrador':
+        return const AdminDashboardPage();
+      case 'Gestión de Pacientes':
+        return const PatientsPage();
+      case 'Historial de Pacientes Inactivos':
+        return const InactivePatientsHistoryPage();
+      case 'Gestión de Empleados':
+        return const EmployeesPage();
+      case 'Gestión de Solicitudes':
+        return const RequestsPage();
+      case 'Gestión de Habitaciones':
+        return const RoomsPage();
+      case 'Gestión de Turnos':
+        return const ShiftsPage();
+      case 'Contactos de Emergencia':
+        return const AdminEmergencyContactsPage();
+      case 'Permisos Temporales':
+        return const PermissionsPage();
+      case 'Historial del Administrador':
+        return const AdminHistoryPage();
+      default:
+        return homePage;
+    }
+  }
+
+  if (role == 'Paciente') {
+    switch (title) {
+      case 'Panel Paciente':
+      case 'Bienvenido/a':
+        return const PatientDashboardPage();
+      default:
+        return homePage;
+    }
+  }
+
+  return homePage;
+}
+
+Future<void> refrescarVistaActual(BuildContext context, String role, String title, Widget homePage) async {
+  try {
+    await cargarSesionActualDesdeSupabase();
+    if (!context.mounted) return;
+    ScaffoldMessenger.of(context).showSnackBar(
+      const SnackBar(content: Text('Datos actualizados correctamente')),
+    );
+    Navigator.pushReplacement(
+      context,
+      MaterialPageRoute(builder: (_) => paginaActualPorRolYTitulo(role, title, homePage)),
+    );
+  } catch (e) {
+    if (!context.mounted) return;
+    ScaffoldMessenger.of(context).showSnackBar(
+      SnackBar(content: Text('Error al actualizar datos: $e'), backgroundColor: Colors.red),
+    );
+  }
+}
+
 // Estructura general reutilizable con encabezado, rol, botones de inicio y cierre de sesión.
 class BaseLayout extends StatelessWidget {
   final String role;
@@ -6164,33 +6524,22 @@ class BaseLayout extends StatelessWidget {
             ),
           ],
         ),
-        actions: isMobile
-            ? [
-          IconButton(
-            tooltip: 'Inicio',
-            onPressed: () => Navigator.pushReplacement(
-              context,
-              MaterialPageRoute(builder: (_) => homePage),
-            ),
-            icon: const Icon(Icons.home),
-          ),
-          IconButton(
-            tooltip: 'Cerrar Sesión',
-            onPressed: () => Navigator.pushReplacement(
-              context,
-              MaterialPageRoute(builder: (_) => const LoginPage()),
-            ),
-            icon: const Icon(Icons.logout, color: Colors.red),
-          ),
-        ]
-            : [
+        actions: [
           TextButton.icon(
             onPressed: () => Navigator.pushReplacement(
               context,
               MaterialPageRoute(builder: (_) => homePage),
             ),
             icon: const Icon(Icons.home),
-            label: const Text('Inicio'),
+            label: isMobile ? const SizedBox.shrink() : const Text('Inicio'),
+          ),
+          const SizedBox(width: 8),
+          IconButton(
+            tooltip: 'Actualizar',
+            onPressed: () async {
+              await refrescarVistaActual(context, role, title, homePage);
+            },
+            icon: const Icon(Icons.refresh),
           ),
           const SizedBox(width: 8),
           TextButton.icon(
@@ -6199,7 +6548,9 @@ class BaseLayout extends StatelessWidget {
               MaterialPageRoute(builder: (_) => const LoginPage()),
             ),
             icon: const Icon(Icons.logout, color: Colors.red),
-            label: const Text(
+            label: isMobile
+                ? const SizedBox.shrink()
+                : const Text(
               'Cerrar Sesión',
               style: TextStyle(color: Colors.red),
             ),

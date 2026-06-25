@@ -996,6 +996,20 @@ class ProfessionalRequestDetailPage extends StatelessWidget {
   }
 }
 
+String normalizarEstadoSolicitud(String estado) {
+  final e = estado.toLowerCase().trim();
+
+  if (e.contains('complet') || e.contains('finaliz')) return 'completada';
+  if (e.contains('cancel')) return 'cancelada';
+  if (e.contains('reasign')) return 'reasignada';
+  if (e.contains('proceso')) return 'en proceso';
+  if (e.contains('acept')) return 'aceptada';
+  if (e.contains('pend')) return 'pendiente';
+  if (e.contains('asign')) return 'asignada';
+
+  return e;
+}
+
 // Historial del profesional con solicitudes finalizadas, canceladas o reasignadas.
 class ProfessionalHistoryPage extends StatelessWidget {
   const ProfessionalHistoryPage({super.key});
@@ -1070,7 +1084,7 @@ Widget paginaProfesionalActualPorTitulo(String title) {
     case 'Historial de Solicitudes':
       return const ProfessionalHistoryPage();
     case 'Gestión temporal de solicitudes':
-      return const TemporaryRequestManagementPage();
+      return const ProfessionalTasksPage();
     default:
       return const ProfessionalDashboardPage();
   }

@@ -1870,12 +1870,18 @@ bool validarTelefonoChile(String telefono) {
 
 // Recarga los datos reales desde Supabase sin cerrar sesión.
 // Se usa desde los botones de actualizar de administrador, paciente y profesional.
-Future<void> cargarSesionActualDesdeSupabase() async {
-  final usuario = usuarioSesion;
-  final rol = rolSesion;
-  if (usuario == null || rol.isEmpty) return;
 
+// Carga optimizada de sesión desde Supabase.
+// Antes, la app hacía consultas dentro de cada for, por ejemplo una consulta por cada paciente,
+// solicitud, contacto o empleado. En APK eso puede demorar mucho.
+// Esta versión carga catálogos completos una sola vez y luego cruza los datos en memoria.
+Future<void> cargarDatosSesionOptimizadoDesdeSupabase(
+    Map<String, dynamic> usuario,
+    String rol, {
+      bool cargarHistoriales = true,
+    }) async {
   final supabase = Supabase.instance.client;
+
   usuarioSesion = usuario;
   rolSesion = rol;
   pacienteSesion = null;
@@ -1891,13 +1897,37 @@ Future<void> cargarSesionActualDesdeSupabase() async {
   historialAdmin.clear();
   historialProfesional.clear();
 
-  final habitacionesDb = await supabase
-      .from('habitacion')
-      .select('id_habitacion, nro_hab, piso, capacidad, estado');
-  for (final h in List<Map<String, dynamic>>.from(habitacionesDb)) {
+  // =========================
+  // 1) Catálogos base
+  // =========================
+  final resultadosBase = await Future.wait<dynamic>([
+    supabase.from('habitacion').select(
+      'id_habitacion, nro_hab, piso, capacidad, estado',
+    ),
+    supabase.from('cargo').select('id_cargo, nombre_cargo'),
+    supabase.from('tipo_solicitud').select('id_tipo, nombre_tipo'),
+    supabase.from('prioridad').select('id_prioridad, tipo_prioridad'),
+    supabase.from('estado_asig').select('id_est_asig, nombre'),
+    supabase.from('estado_sol').select('id_est, nombre_estado'),
+  ]);
+
+  final habitacionesDb = List<Map<String, dynamic>>.from(resultadosBase[0]);
+  final cargosDb = List<Map<String, dynamic>>.from(resultadosBase[1]);
+  final tiposDb = List<Map<String, dynamic>>.from(resultadosBase[2]);
+  final prioridadesDb = List<Map<String, dynamic>>.from(resultadosBase[3]);
+  final estadosAsigDb = List<Map<String, dynamic>>.from(resultadosBase[4]);
+  final estadosSolDb = List<Map<String, dynamic>>.from(resultadosBase[5]);
+
+  final habitacionNumeroPorId = <int, String>{};
+  for (final h in habitacionesDb) {
+    final id = h['id_habitacion'] as int?;
+    if (id != null) {
+      habitacionNumeroPorId[id] = (h['nro_hab'] ?? 'Sin habitación').toString();
+    }
+
     habitaciones.add(
       Habitacion(
-        idHabitacion: h['id_habitacion'] as int?,
+        idHabitacion: id,
         numero: (h['nro_hab'] ?? '').toString(),
         piso: 'Piso ${h['piso'] ?? ''}',
         capacidad: h['capacidad'] ?? 1,
@@ -1908,34 +1938,59 @@ Future<void> cargarSesionActualDesdeSupabase() async {
     );
   }
 
-  // IMPORTANTE: no se usa select('*, habitacion(...)') porque en la BD hay varias
-  // relaciones entre paciente, habitacion e hist_hab. Si se usa embed, Supabase
-  // lanza error PGRST201. Por eso se consulta paciente y habitación por separado.
-  final pacientesDb = await supabase.from('paciente').select();
-  for (final p in List<Map<String, dynamic>>.from(pacientesDb)) {
+  final cargoPorId = <int, String>{};
+  for (final c in cargosDb) {
+    final id = c['id_cargo'] as int?;
+    if (id != null) cargoPorId[id] = (c['nombre_cargo'] ?? 'Empleado').toString();
+  }
+
+  final tipoPorId = <int, String>{};
+  for (final t in tiposDb) {
+    final id = t['id_tipo'] as int?;
+    if (id != null) tipoPorId[id] = (t['nombre_tipo'] ?? 'Otro').toString();
+  }
+
+  final prioridadPorId = <int, String>{};
+  for (final p in prioridadesDb) {
+    final id = p['id_prioridad'] as int?;
+    if (id != null) prioridadPorId[id] = (p['tipo_prioridad'] ?? 'Media').toString();
+  }
+
+  final estadoAsigPorId = <int, String>{};
+  for (final e in estadosAsigDb) {
+    final id = e['id_est_asig'] as int?;
+    if (id != null) estadoAsigPorId[id] = (e['nombre'] ?? 'Asignada').toString();
+  }
+
+  final estadoSolPorId = <int, String>{};
+  for (final e in estadosSolDb) {
+    final id = e['id_est'] as int?;
+    if (id != null) estadoSolPorId[id] = (e['nombre_estado'] ?? 'Acción registrada').toString();
+  }
+
+  // =========================
+  // 2) Pacientes y empleados
+  // =========================
+  final resultadosPersonas = await Future.wait<dynamic>([
+    supabase.from('paciente').select(),
+    supabase.from('empleado').select(),
+  ]);
+
+  final pacientesDb = List<Map<String, dynamic>>.from(resultadosPersonas[0]);
+  final empleadosDb = List<Map<String, dynamic>>.from(resultadosPersonas[1]);
+
+  final nombrePacientePorId = <int, String>{};
+  for (final p in pacientesDb) {
     final nombreCompleto =
     '${p['p_nombre'] ?? ''} ${p['s_nombre'] ?? ''} ${p['ap_paterno'] ?? ''} ${p['ap_materno'] ?? ''}'
         .replaceAll(RegExp(r'\s+'), ' ')
         .trim();
 
-    String textoHabitacion = 'Sin habitación';
-    final idHabitacion = p['id_habitacion'];
-    if (idHabitacion != null) {
-      final habitacionDb = await supabase
-          .from('habitacion')
-          .select('nro_hab')
-          .eq('id_habitacion', idHabitacion)
-          .maybeSingle();
-      if (habitacionDb != null) {
-        textoHabitacion = (habitacionDb['nro_hab'] ?? 'Sin habitación')
-            .toString();
-      }
-    }
-
+    final idHabitacion = p['id_habitacion'] as int?;
     final paciente = Paciente(
       idPaciente: p['id_paciente'] as int?,
       idUsuario: p['id_usuario'] as int?,
-      idHabitacion: p['id_habitacion'] as int?,
+      idHabitacion: idHabitacion,
       nombre: nombreCompleto,
       rut: (p['rut_paciente'] ?? '').toString(),
       telefono: (p['telefono'] ?? '').toString(),
@@ -1944,84 +1999,80 @@ Future<void> cargarSesionActualDesdeSupabase() async {
       fechaNacimiento:
       DateTime.tryParse((p['fecha_nacimiento'] ?? '').toString()) ??
           DateTime(1950, 1, 1),
-      habitacion: textoHabitacion,
+      habitacion: idHabitacion == null
+          ? 'Sin habitación'
+          : (habitacionNumeroPorId[idHabitacion] ?? 'Sin habitación'),
       fechaIngreso: (p['fecha_ingreso'] ?? '').toString(),
       estado: (p['estado'] ?? 'Activo').toString(),
       diagnostico: '',
       alergias: '',
       medicamentos: '',
     );
+
     pacientes.add(paciente);
+    if (paciente.idPaciente != null) nombrePacientePorId[paciente.idPaciente!] = paciente.nombre;
     if (p['id_usuario'] == usuario['id_usuario']) pacienteSesion = paciente;
   }
 
-  await SeniorCareDb.cargarHistorialPacientesInactivosDesdeSupabase();
-
-  // Se consulta cargo aparte para evitar problemas similares de relaciones automáticas.
-  final empleadosDb = await supabase.from('empleado').select();
-  for (final e in List<Map<String, dynamic>>.from(empleadosDb)) {
+  final nombreEmpleadoPorId = <int, String>{};
+  for (final e in empleadosDb) {
     final nombreCompleto =
     '${e['p_nombre'] ?? ''} ${e['s_nombre'] ?? ''} ${e['ap_paterno'] ?? ''} ${e['ap_materno'] ?? ''}'
         .replaceAll(RegExp(r'\s+'), ' ')
         .trim();
 
-    String nombreCargo = 'Empleado';
-    final idCargo = e['id_cargo'];
-    if (idCargo != null) {
-      final cargoDb = await supabase
-          .from('cargo')
-          .select('nombre_cargo')
-          .eq('id_cargo', idCargo)
-          .maybeSingle();
-      if (cargoDb != null)
-        nombreCargo = (cargoDb['nombre_cargo'] ?? 'Empleado').toString();
-    }
-
+    final idCargo = e['id_cargo'] as int?;
     final empleado = Empleado(
       idEmpleado: e['id_empleado'] as int?,
       idUsuario: e['id_usuario'] as int?,
-      idCargo: e['id_cargo'] as int?,
+      idCargo: idCargo,
       nombre: nombreCompleto,
       rut: (e['rut_empleado'] ?? '').toString(),
-      cargo: nombreCargo,
+      cargo: idCargo == null ? 'Empleado' : (cargoPorId[idCargo] ?? 'Empleado'),
       telefono: (e['telefono'] ?? '').toString(),
       estado: 'Activo',
     );
+
     empleados.add(empleado);
+    if (empleado.idEmpleado != null) nombreEmpleadoPorId[empleado.idEmpleado!] = empleado.nombre;
     if (e['id_usuario'] == usuario['id_usuario']) empleadoSesion = empleado;
   }
 
-  // Carga todos los contactos de emergencia desde Supabase.
-  // El paciente verá solo sus propios contactos por el filtro de la pantalla,
-  // mientras que el administrador podrá ver todos los contactos registrados.
-  final contactosDb = await supabase
-      .from('paciente_cont')
-      .select('id_paciente_cont, prioridad, id_cont_emer, id_paciente');
-  for (final c in List<Map<String, dynamic>>.from(contactosDb)) {
-    final idContacto = c['id_cont_emer'];
-    final idPacienteContacto = c['id_paciente'];
+  // =========================
+  // 3) Contactos de emergencia
+  // =========================
+  final resultadosContactos = await Future.wait<dynamic>([
+    supabase.from('paciente_cont').select(
+      'id_paciente_cont, prioridad, id_cont_emer, id_paciente',
+    ),
+    supabase.from('cont_emer').select(
+      'id_cont_emer, p_nombre, ap_paterno, ap_materno, telefono, correo, direccion',
+    ),
+  ]);
+
+  final pacienteContDb = List<Map<String, dynamic>>.from(resultadosContactos[0]);
+  final contactosDb = List<Map<String, dynamic>>.from(resultadosContactos[1]);
+
+  final contactoPorId = <int, Map<String, dynamic>>{};
+  for (final c in contactosDb) {
+    final id = c['id_cont_emer'] as int?;
+    if (id != null) contactoPorId[id] = c;
+  }
+
+  for (final c in pacienteContDb) {
+    final idContacto = c['id_cont_emer'] as int?;
+    final idPacienteContacto = c['id_paciente'] as int?;
     if (idContacto == null || idPacienteContacto == null) continue;
 
-    final pacienteRelacionado = pacientes
-        .where((p) => p.idPaciente == idPacienteContacto)
-        .toList();
-    final nombrePacienteContacto = pacienteRelacionado.isNotEmpty
-        ? pacienteRelacionado.first.nombre
-        : 'Paciente no cargado';
-
-    final ce = await supabase
-        .from('cont_emer')
-        .select('p_nombre, ap_paterno, ap_materno, telefono, correo, direccion')
-        .eq('id_cont_emer', idContacto)
-        .maybeSingle();
+    final ce = contactoPorId[idContacto];
     if (ce == null) continue;
 
     contactosEmergencia.add(
       ContactoEmergencia(
-        idContEmer: idContacto as int?,
+        idContEmer: idContacto,
         idPacienteCont: c['id_paciente_cont'] as int?,
-        idPaciente: idPacienteContacto as int?,
-        paciente: nombrePacienteContacto,
+        idPaciente: idPacienteContacto,
+        paciente: nombrePacientePorId[idPacienteContacto] ?? 'Paciente no cargado',
         nombre:
         '${ce['p_nombre'] ?? ''} ${ce['ap_paterno'] ?? ''} ${ce['ap_materno'] ?? ''}'
             .replaceAll(RegExp(r'\s+'), ' ')
@@ -2034,154 +2085,158 @@ Future<void> cargarSesionActualDesdeSupabase() async {
     );
   }
 
-  // Carga solicitudes reales desde Supabase sin relaciones embebidas.
-  final solicitudesDb = await supabase
-      .from('solicitud')
-      .select(
-    'id_solicitud, fecha_creacion, descripcion, id_tipo, id_paciente',
-  );
-  for (final sol in List<Map<String, dynamic>>.from(solicitudesDb)) {
-    final idPaciente = sol['id_paciente'];
-    final pacienteRelacionado = pacientes
-        .where((p) => p.idPaciente == idPaciente)
-        .toList();
-    final nombrePaciente = pacienteRelacionado.isNotEmpty
-        ? pacienteRelacionado.first.nombre
-        : 'Paciente no cargado';
-
-    String tipoNombre = 'Otro';
-    if (sol['id_tipo'] != null) {
-      final tipoDb = await supabase
-          .from('tipo_solicitud')
-          .select('nombre_tipo')
-          .eq('id_tipo', sol['id_tipo'])
-          .maybeSingle();
-      if (tipoDb != null)
-        tipoNombre = (tipoDb['nombre_tipo'] ?? 'Otro').toString();
-    }
-
-    String prioridadNombre = 'Media';
-    final priDb = await supabase
+  // =========================
+  // 4) Solicitudes y estados
+  // =========================
+  final resultadosSolicitudes = await Future.wait<dynamic>([
+    supabase.from('solicitud').select(
+      'id_solicitud, fecha_creacion, descripcion, id_tipo, id_paciente',
+    ),
+    supabase
         .from('sol_prioridad')
-        .select('id_prioridad')
-        .eq('id_solicitud', sol['id_solicitud'])
-        .order('fecha_cambio', ascending: false)
-        .limit(1)
-        .maybeSingle();
-    if (priDb != null && priDb['id_prioridad'] != null) {
-      final pDb = await supabase
-          .from('prioridad')
-          .select('tipo_prioridad')
-          .eq('id_prioridad', priDb['id_prioridad'])
-          .maybeSingle();
-      if (pDb != null)
-        prioridadNombre = (pDb['tipo_prioridad'] ?? 'Media').toString();
+        .select('id_prioridad, id_solicitud, fecha_cambio')
+        .order('fecha_cambio', ascending: false),
+    supabase
+        .from('asignacion')
+        .select('id_asig, fecha_asignacion, id_solicitud, id_empleado')
+        .order('fecha_asignacion', ascending: false),
+    supabase
+        .from('asig_estado')
+        .select('id_est_asig, id_asig, fecha')
+        .order('fecha', ascending: false),
+    supabase
+        .from('historial_sol')
+        .select('id_solicitud, id_est, fecha')
+        .order('fecha', ascending: false),
+  ]);
+
+  final solicitudesDb = List<Map<String, dynamic>>.from(resultadosSolicitudes[0]);
+  final solPrioridadDb = List<Map<String, dynamic>>.from(resultadosSolicitudes[1]);
+  final asignacionesDb = List<Map<String, dynamic>>.from(resultadosSolicitudes[2]);
+  final asigEstadoDb = List<Map<String, dynamic>>.from(resultadosSolicitudes[3]);
+  final historialSolDb = List<Map<String, dynamic>>.from(resultadosSolicitudes[4]);
+
+  final prioridadUltimaPorSolicitud = <int, int>{};
+  for (final p in solPrioridadDb) {
+    final idSolicitud = p['id_solicitud'] as int?;
+    final idPrioridad = p['id_prioridad'] as int?;
+    if (idSolicitud != null && idPrioridad != null) {
+      prioridadUltimaPorSolicitud.putIfAbsent(idSolicitud, () => idPrioridad);
     }
+  }
+
+  final asignacionUltimaPorSolicitud = <int, Map<String, dynamic>>{};
+  for (final a in asignacionesDb) {
+    final idSolicitud = a['id_solicitud'] as int?;
+    if (idSolicitud != null) {
+      asignacionUltimaPorSolicitud.putIfAbsent(idSolicitud, () => a);
+    }
+  }
+
+  final estadoUltimoPorAsignacion = <int, int>{};
+  for (final ae in asigEstadoDb) {
+    final idAsig = ae['id_asig'] as int?;
+    final idEstadoAsig = ae['id_est_asig'] as int?;
+    if (idAsig != null && idEstadoAsig != null) {
+      estadoUltimoPorAsignacion.putIfAbsent(idAsig, () => idEstadoAsig);
+    }
+  }
+
+  final estadoUltimoPorSolicitud = <int, int>{};
+  for (final h in historialSolDb) {
+    final idSolicitud = h['id_solicitud'] as int?;
+    final idEstado = h['id_est'] as int?;
+    if (idSolicitud != null && idEstado != null) {
+      estadoUltimoPorSolicitud.putIfAbsent(idSolicitud, () => idEstado);
+    }
+  }
+
+  for (final sol in solicitudesDb) {
+    final idSolicitud = sol['id_solicitud'] as int?;
+    if (idSolicitud == null) continue;
+
+    final idPaciente = sol['id_paciente'] as int?;
+    final idTipo = sol['id_tipo'] as int?;
+    final idPrioridad = prioridadUltimaPorSolicitud[idSolicitud];
+    final asig = asignacionUltimaPorSolicitud[idSolicitud];
 
     String estadoNombre = 'Creada';
     String asignadoNombre = 'Sin asignar';
     int? idAsignacion;
     int? idEmpleadoAsignado;
     String? horaAsignacion;
-    final asigDb = await supabase
-        .from('asignacion')
-        .select('id_asig, fecha_asignacion, id_empleado')
-        .eq('id_solicitud', sol['id_solicitud'])
-        .order('fecha_asignacion', ascending: false)
-        .limit(1)
-        .maybeSingle();
-    if (asigDb != null) {
-      idAsignacion = asigDb['id_asig'] as int?;
-      idEmpleadoAsignado = asigDb['id_empleado'] as int?;
-      final empleadoRelacionado = empleados
-          .where((e) => e.idEmpleado == idEmpleadoAsignado)
-          .toList();
-      if (empleadoRelacionado.isNotEmpty)
-        asignadoNombre = empleadoRelacionado.first.nombre;
-      final fechaAsig = DateTime.tryParse(
-        (asigDb['fecha_asignacion'] ?? '').toString(),
-      );
-      if (fechaAsig != null) horaAsignacion = formatDateTime(fechaAsig);
-      final estadoAsigDb = await supabase
-          .from('asig_estado')
-          .select('id_est_asig')
-          .eq('id_asig', idAsignacion ?? -1)
-          .order('fecha', ascending: false)
-          .limit(1)
-          .maybeSingle();
-      if (estadoAsigDb != null && estadoAsigDb['id_est_asig'] != null) {
-        final eDb = await supabase
-            .from('estado_asig')
-            .select('nombre')
-            .eq('id_est_asig', estadoAsigDb['id_est_asig'])
-            .maybeSingle();
-        if (eDb != null)
-          estadoNombre = (eDb['nombre'] ?? 'Asignada').toString();
-      } else {
-        estadoNombre = 'Asignada';
-      }
+
+    if (asig != null) {
+      idAsignacion = asig['id_asig'] as int?;
+      idEmpleadoAsignado = asig['id_empleado'] as int?;
+      asignadoNombre = idEmpleadoAsignado == null
+          ? 'Sin asignar'
+          : (nombreEmpleadoPorId[idEmpleadoAsignado] ?? 'Empleado no cargado');
+
+      final fechaAsig = DateTime.tryParse((asig['fecha_asignacion'] ?? '').toString());
+      if (fechaAsig != null) horaAsignacion = formatDateTime(fechaAsig.toLocal());
+
+      final idEstadoAsig = idAsignacion == null ? null : estadoUltimoPorAsignacion[idAsignacion];
+      estadoNombre = idEstadoAsig == null
+          ? 'Asignada'
+          : (estadoAsigPorId[idEstadoAsig] ?? 'Asignada');
     }
 
-    // Revisa el último estado real guardado por el profesional en historial_sol.
-    // La tabla solicitud no tiene columna estado, por eso el estado actual se recupera
-    // desde el último registro de historial_sol.
-    final histDb = await supabase
-        .from('historial_sol')
-        .select('id_est, fecha')
-        .eq('id_solicitud', sol['id_solicitud'])
-        .order('fecha', ascending: false)
-        .limit(1)
-        .maybeSingle();
-
-    if (histDb != null && histDb['id_est'] != null) {
-      final estadoDb = await supabase
-          .from('estado_sol')
-          .select('nombre_estado')
-          .eq('id_est', histDb['id_est'])
-          .maybeSingle();
-      if (estadoDb != null) {
-        estadoNombre = (estadoDb['nombre_estado'] ?? estadoNombre).toString();
-      }
+    final idEstadoSolicitud = estadoUltimoPorSolicitud[idSolicitud];
+    if (idEstadoSolicitud != null) {
+      estadoNombre = estadoSolPorId[idEstadoSolicitud] ?? estadoNombre;
     }
 
     final fechaCreacion = DateTime.tryParse(
       (sol['fecha_creacion'] ?? '').toString(),
     );
+
     solicitudes.add(
       Solicitud(
-        idSolicitud: sol['id_solicitud'] as int?,
+        idSolicitud: idSolicitud,
         idAsignacion: idAsignacion,
         idEmpleadoAsignado: idEmpleadoAsignado,
-        titulo: 'Solicitud #${sol['id_solicitud']}',
+        titulo: 'Solicitud #$idSolicitud',
         descripcion: (sol['descripcion'] ?? '').toString(),
-        paciente: nombrePaciente,
-        tipo: tipoNombre,
-        fecha: fechaCreacion == null ? '' : formatDate(fechaCreacion),
+        paciente: idPaciente == null
+            ? 'Paciente no cargado'
+            : (nombrePacientePorId[idPaciente] ?? 'Paciente no cargado'),
+        tipo: idTipo == null ? 'Otro' : (tipoPorId[idTipo] ?? 'Otro'),
+        fecha: fechaCreacion == null ? '' : formatDate(fechaCreacion.toLocal()),
         estado: estadoNombre,
-        prioridad: prioridadNombre,
+        prioridad: idPrioridad == null
+            ? 'Media'
+            : (prioridadPorId[idPrioridad] ?? 'Media'),
         asignadoA: asignadoNombre,
         horaCreacion: fechaCreacion == null
             ? ''
-            : formatDateTime(fechaCreacion),
+            : formatDateTime(fechaCreacion.toLocal()),
         horaAsignacion: horaAsignacion,
       ),
     );
   }
 
-  // Carga turnos reales desde Supabase.
+  // =========================
+  // 5) Turnos
+  // =========================
   final turnosDb = await supabase
       .from('turno')
       .select('id_turno, dia_semana, hora_inicio, hora_fin, id_empleado');
+
   for (final t in List<Map<String, dynamic>>.from(turnosDb)) {
     final idEmpleado = t['id_empleado'] as int?;
-    final empleadoRelacionado = empleados
-        .where((e) => e.idEmpleado == idEmpleado)
-        .toList();
+    final empleadoRelacionado = idEmpleado == null
+        ? <Empleado>[]
+        : empleados.where((e) => e.idEmpleado == idEmpleado).toList();
     final empleado = empleadoRelacionado.isNotEmpty
         ? empleadoRelacionado.first
         : null;
+
     final diaTurno = (t['dia_semana'] ?? '').toString();
     final esLibre = diaTurno.startsWith('Libre:');
+    final horaInicioTexto = (t['hora_inicio'] ?? '').toString();
+    final horaFinTexto = (t['hora_fin'] ?? '').toString();
+
     turnos.add(
       Turno(
         idTurno: t['id_turno'] as int?,
@@ -2191,21 +2246,49 @@ Future<void> cargarSesionActualDesdeSupabase() async {
         fecha: esLibre ? diaTurno.replaceFirst('Libre:', '').trim() : diaTurno,
         horaInicio: esLibre
             ? 'Libre'
-            : (t['hora_inicio'] ?? '').toString().substring(0, 5),
+            : (horaInicioTexto.length >= 5 ? horaInicioTexto.substring(0, 5) : horaInicioTexto),
         horaTermino: esLibre
             ? 'Libre'
-            : (t['hora_fin'] ?? '').toString().substring(0, 5),
+            : (horaFinTexto.length >= 5 ? horaFinTexto.substring(0, 5) : horaFinTexto),
         estado: esLibre ? 'Libre' : 'Asignado',
       ),
     );
   }
 
   await SeniorCareDb.cargarPermisosTemporalesDesdeSupabase();
-  await SeniorCareDb.cargarHistorialProfesionalDesdeSupabase();
-  await SeniorCareDb.cargarHistorialAdminDesdeSupabase();
-  eliminarDuplicadosSesionEnMemoria();
 
+  if (cargarHistoriales) {
+    await cargarHistorialesSesionDesdeSupabase(rol);
+  }
+
+  eliminarDuplicadosSesionEnMemoria();
   sincronizarHabitacionesConPacientes();
+}
+
+Future<void> cargarHistorialesSesionDesdeSupabase(String rol) async {
+  final rolNormalizado = rol.toLowerCase();
+
+  // Se cargan solo los historiales necesarios para el rol actual.
+  // Esto evita trabajo extra al iniciar sesión como paciente o profesional.
+  if (rolNormalizado == 'administrador') {
+    await SeniorCareDb.cargarHistorialPacientesInactivosDesdeSupabase();
+    await SeniorCareDb.cargarHistorialAdminDesdeSupabase();
+  } else if (rolNormalizado == 'empleado' ||
+      rolNormalizado == 'profesional' ||
+      rolNormalizado == 'trabajador') {
+    await SeniorCareDb.cargarHistorialProfesionalDesdeSupabase();
+  } else if (rolNormalizado == 'paciente') {
+    // El paciente no necesita cargar historial administrativo completo al iniciar.
+  }
+}
+
+
+Future<void> cargarSesionActualDesdeSupabase() async {
+  final usuario = usuarioSesion;
+  final rol = rolSesion;
+  if (usuario == null || rol.isEmpty) return;
+
+  await cargarDatosSesionOptimizadoDesdeSupabase(usuario, rol);
 }
 
 Future<void> refrescarSesionActual(
@@ -3044,339 +3127,13 @@ class _LoginPageState extends State<LoginPage> {
       Map<String, dynamic> usuario,
       String rol,
       ) async {
-    final supabase = Supabase.instance.client;
-    usuarioSesion = usuario;
-    rolSesion = rol;
-    pacienteSesion = null;
-    empleadoSesion = null;
-
-    pacientes.clear();
-    empleados.clear();
-    solicitudes.clear();
-    habitaciones.clear();
-    turnos.clear();
-    contactosEmergencia.clear();
-    historialPacientesInactivos.clear();
-    historialAdmin.clear();
-    historialProfesional.clear();
-
-    final habitacionesDb = await supabase
-        .from('habitacion')
-        .select('id_habitacion, nro_hab, piso, capacidad, estado');
-    for (final h in List<Map<String, dynamic>>.from(habitacionesDb)) {
-      habitaciones.add(
-        Habitacion(
-          idHabitacion: h['id_habitacion'] as int?,
-          numero: (h['nro_hab'] ?? '').toString(),
-          piso: 'Piso ${h['piso'] ?? ''}',
-          capacidad: h['capacidad'] ?? 1,
-          ocupantes: 0,
-          estado: (h['estado'] ?? 'Disponible').toString(),
-          paciente: 'Sin paciente',
-        ),
-      );
-    }
-
-    // IMPORTANTE: no se usa select('*, habitacion(...)') porque en la BD hay varias
-    // relaciones entre paciente, habitacion e hist_hab. Si se usa embed, Supabase
-    // lanza error PGRST201. Por eso se consulta paciente y habitación por separado.
-    final pacientesDb = await supabase.from('paciente').select();
-    for (final p in List<Map<String, dynamic>>.from(pacientesDb)) {
-      final nombreCompleto =
-      '${p['p_nombre'] ?? ''} ${p['s_nombre'] ?? ''} ${p['ap_paterno'] ?? ''} ${p['ap_materno'] ?? ''}'
-          .replaceAll(RegExp(r'\s+'), ' ')
-          .trim();
-
-      String textoHabitacion = 'Sin habitación';
-      final idHabitacion = p['id_habitacion'];
-      if (idHabitacion != null) {
-        final habitacionDb = await supabase
-            .from('habitacion')
-            .select('nro_hab')
-            .eq('id_habitacion', idHabitacion)
-            .maybeSingle();
-        if (habitacionDb != null) {
-          textoHabitacion = (habitacionDb['nro_hab'] ?? 'Sin habitación')
-              .toString();
-        }
-      }
-
-      final paciente = Paciente(
-        idPaciente: p['id_paciente'] as int?,
-        idUsuario: p['id_usuario'] as int?,
-        idHabitacion: p['id_habitacion'] as int?,
-        nombre: nombreCompleto,
-        rut: (p['rut_paciente'] ?? '').toString(),
-        telefono: (p['telefono'] ?? '').toString(),
-        correo: (usuario['correo'] ?? '').toString(),
-        direccion: (p['direccion'] ?? '').toString(),
-        fechaNacimiento:
-        DateTime.tryParse((p['fecha_nacimiento'] ?? '').toString()) ??
-            DateTime(1950, 1, 1),
-        habitacion: textoHabitacion,
-        fechaIngreso: (p['fecha_ingreso'] ?? '').toString(),
-        estado: (p['estado'] ?? 'Activo').toString(),
-        diagnostico: '',
-        alergias: '',
-        medicamentos: '',
-      );
-      pacientes.add(paciente);
-      if (p['id_usuario'] == usuario['id_usuario']) pacienteSesion = paciente;
-    }
-
-    // Se consulta cargo aparte para evitar problemas similares de relaciones automáticas.
-    final empleadosDb = await supabase.from('empleado').select();
-    for (final e in List<Map<String, dynamic>>.from(empleadosDb)) {
-      final nombreCompleto =
-      '${e['p_nombre'] ?? ''} ${e['s_nombre'] ?? ''} ${e['ap_paterno'] ?? ''} ${e['ap_materno'] ?? ''}'
-          .replaceAll(RegExp(r'\s+'), ' ')
-          .trim();
-
-      String nombreCargo = 'Empleado';
-      final idCargo = e['id_cargo'];
-      if (idCargo != null) {
-        final cargoDb = await supabase
-            .from('cargo')
-            .select('nombre_cargo')
-            .eq('id_cargo', idCargo)
-            .maybeSingle();
-        if (cargoDb != null)
-          nombreCargo = (cargoDb['nombre_cargo'] ?? 'Empleado').toString();
-      }
-
-      final empleado = Empleado(
-        idEmpleado: e['id_empleado'] as int?,
-        idUsuario: e['id_usuario'] as int?,
-        idCargo: e['id_cargo'] as int?,
-        nombre: nombreCompleto,
-        rut: (e['rut_empleado'] ?? '').toString(),
-        cargo: nombreCargo,
-        telefono: (e['telefono'] ?? '').toString(),
-        estado: 'Activo',
-      );
-      empleados.add(empleado);
-      if (e['id_usuario'] == usuario['id_usuario']) empleadoSesion = empleado;
-    }
-
-    // Carga todos los contactos de emergencia desde Supabase.
-    // El paciente verá solo sus propios contactos por el filtro de la pantalla,
-    // mientras que el administrador podrá ver todos los contactos registrados.
-    final contactosDb = await supabase
-        .from('paciente_cont')
-        .select('id_paciente_cont, prioridad, id_cont_emer, id_paciente');
-    for (final c in List<Map<String, dynamic>>.from(contactosDb)) {
-      final idContacto = c['id_cont_emer'];
-      final idPacienteContacto = c['id_paciente'];
-      if (idContacto == null || idPacienteContacto == null) continue;
-
-      final pacienteRelacionado = pacientes
-          .where((p) => p.idPaciente == idPacienteContacto)
-          .toList();
-      final nombrePacienteContacto = pacienteRelacionado.isNotEmpty
-          ? pacienteRelacionado.first.nombre
-          : 'Paciente no cargado';
-
-      final ce = await supabase
-          .from('cont_emer')
-          .select(
-        'p_nombre, ap_paterno, ap_materno, telefono, correo, direccion',
-      )
-          .eq('id_cont_emer', idContacto)
-          .maybeSingle();
-      if (ce == null) continue;
-
-      contactosEmergencia.add(
-        ContactoEmergencia(
-          idContEmer: idContacto as int?,
-          idPacienteCont: c['id_paciente_cont'] as int?,
-          idPaciente: idPacienteContacto as int?,
-          paciente: nombrePacienteContacto,
-          nombre:
-          '${ce['p_nombre'] ?? ''} ${ce['ap_paterno'] ?? ''} ${ce['ap_materno'] ?? ''}'
-              .replaceAll(RegExp(r'\s+'), ' ')
-              .trim(),
-          telefono: (ce['telefono'] ?? '').toString(),
-          email: (ce['correo'] ?? '').toString(),
-          direccion: (ce['direccion'] ?? '').toString(),
-          prioridad: c['prioridad'] ?? 1,
-        ),
-      );
-    }
-
-    // Carga solicitudes reales desde Supabase sin relaciones embebidas.
-    final solicitudesDb = await supabase
-        .from('solicitud')
-        .select(
-      'id_solicitud, fecha_creacion, descripcion, id_tipo, id_paciente',
+    // Carga liviana para entrar más rápido al sistema.
+    // Los historiales se cargan en segundo plano después de abrir la vista.
+    await cargarDatosSesionOptimizadoDesdeSupabase(
+      usuario,
+      rol,
+      cargarHistoriales: false,
     );
-    for (final sol in List<Map<String, dynamic>>.from(solicitudesDb)) {
-      final idPaciente = sol['id_paciente'];
-      final pacienteRelacionado = pacientes
-          .where((p) => p.idPaciente == idPaciente)
-          .toList();
-      final nombrePaciente = pacienteRelacionado.isNotEmpty
-          ? pacienteRelacionado.first.nombre
-          : 'Paciente no cargado';
-
-      String tipoNombre = 'Otro';
-      if (sol['id_tipo'] != null) {
-        final tipoDb = await supabase
-            .from('tipo_solicitud')
-            .select('nombre_tipo')
-            .eq('id_tipo', sol['id_tipo'])
-            .maybeSingle();
-        if (tipoDb != null)
-          tipoNombre = (tipoDb['nombre_tipo'] ?? 'Otro').toString();
-      }
-
-      String prioridadNombre = 'Media';
-      final priDb = await supabase
-          .from('sol_prioridad')
-          .select('id_prioridad')
-          .eq('id_solicitud', sol['id_solicitud'])
-          .order('fecha_cambio', ascending: false)
-          .limit(1)
-          .maybeSingle();
-      if (priDb != null && priDb['id_prioridad'] != null) {
-        final pDb = await supabase
-            .from('prioridad')
-            .select('tipo_prioridad')
-            .eq('id_prioridad', priDb['id_prioridad'])
-            .maybeSingle();
-        if (pDb != null)
-          prioridadNombre = (pDb['tipo_prioridad'] ?? 'Media').toString();
-      }
-
-      String estadoNombre = 'Creada';
-      String asignadoNombre = 'Sin asignar';
-      int? idAsignacion;
-      int? idEmpleadoAsignado;
-      String? horaAsignacion;
-      final asigDb = await supabase
-          .from('asignacion')
-          .select('id_asig, fecha_asignacion, id_empleado')
-          .eq('id_solicitud', sol['id_solicitud'])
-          .order('fecha_asignacion', ascending: false)
-          .limit(1)
-          .maybeSingle();
-      if (asigDb != null) {
-        idAsignacion = asigDb['id_asig'] as int?;
-        idEmpleadoAsignado = asigDb['id_empleado'] as int?;
-        final empleadoRelacionado = empleados
-            .where((e) => e.idEmpleado == idEmpleadoAsignado)
-            .toList();
-        if (empleadoRelacionado.isNotEmpty)
-          asignadoNombre = empleadoRelacionado.first.nombre;
-        final fechaAsig = DateTime.tryParse(
-          (asigDb['fecha_asignacion'] ?? '').toString(),
-        );
-        if (fechaAsig != null) horaAsignacion = formatDateTime(fechaAsig);
-        final estadoAsigDb = await supabase
-            .from('asig_estado')
-            .select('id_est_asig')
-            .eq('id_asig', idAsignacion ?? -1)
-            .order('fecha', ascending: false)
-            .limit(1)
-            .maybeSingle();
-        if (estadoAsigDb != null && estadoAsigDb['id_est_asig'] != null) {
-          final eDb = await supabase
-              .from('estado_asig')
-              .select('nombre')
-              .eq('id_est_asig', estadoAsigDb['id_est_asig'])
-              .maybeSingle();
-          if (eDb != null)
-            estadoNombre = (eDb['nombre'] ?? 'Asignada').toString();
-        } else {
-          estadoNombre = 'Asignada';
-        }
-      }
-
-      // Revisa el último estado real guardado por el profesional en historial_sol.
-      // La tabla solicitud no tiene columna estado, por eso el estado actual se recupera
-      // desde el último registro de historial_sol.
-      final histDb = await supabase
-          .from('historial_sol')
-          .select('id_est, fecha')
-          .eq('id_solicitud', sol['id_solicitud'])
-          .order('fecha', ascending: false)
-          .limit(1)
-          .maybeSingle();
-
-      if (histDb != null && histDb['id_est'] != null) {
-        final estadoDb = await supabase
-            .from('estado_sol')
-            .select('nombre_estado')
-            .eq('id_est', histDb['id_est'])
-            .maybeSingle();
-        if (estadoDb != null) {
-          estadoNombre = (estadoDb['nombre_estado'] ?? estadoNombre).toString();
-        }
-      }
-
-      final fechaCreacion = DateTime.tryParse(
-        (sol['fecha_creacion'] ?? '').toString(),
-      );
-      solicitudes.add(
-        Solicitud(
-          idSolicitud: sol['id_solicitud'] as int?,
-          idAsignacion: idAsignacion,
-          idEmpleadoAsignado: idEmpleadoAsignado,
-          titulo: 'Solicitud #${sol['id_solicitud']}',
-          descripcion: (sol['descripcion'] ?? '').toString(),
-          paciente: nombrePaciente,
-          tipo: tipoNombre,
-          fecha: fechaCreacion == null ? '' : formatDate(fechaCreacion),
-          estado: estadoNombre,
-          prioridad: prioridadNombre,
-          asignadoA: asignadoNombre,
-          horaCreacion: fechaCreacion == null
-              ? ''
-              : formatDateTime(fechaCreacion),
-          horaAsignacion: horaAsignacion,
-        ),
-      );
-    }
-
-    // Carga turnos reales desde Supabase.
-    final turnosDb = await supabase
-        .from('turno')
-        .select('id_turno, dia_semana, hora_inicio, hora_fin, id_empleado');
-    for (final t in List<Map<String, dynamic>>.from(turnosDb)) {
-      final idEmpleado = t['id_empleado'] as int?;
-      final empleadoRelacionado = empleados
-          .where((e) => e.idEmpleado == idEmpleado)
-          .toList();
-      final empleado = empleadoRelacionado.isNotEmpty
-          ? empleadoRelacionado.first
-          : null;
-      final diaTurno = (t['dia_semana'] ?? '').toString();
-      final esLibre = diaTurno.startsWith('Libre:');
-      turnos.add(
-        Turno(
-          idTurno: t['id_turno'] as int?,
-          idEmpleado: idEmpleado,
-          empleado: empleado?.nombre ?? 'Empleado no cargado',
-          cargo: empleado?.cargo ?? 'Sin cargo',
-          fecha: esLibre
-              ? diaTurno.replaceFirst('Libre:', '').trim()
-              : diaTurno,
-          horaInicio: esLibre
-              ? 'Libre'
-              : (t['hora_inicio'] ?? '').toString().substring(0, 5),
-          horaTermino: esLibre
-              ? 'Libre'
-              : (t['hora_fin'] ?? '').toString().substring(0, 5),
-          estado: esLibre ? 'Libre' : 'Asignado',
-        ),
-      );
-    }
-
-    await SeniorCareDb.cargarPermisosTemporalesDesdeSupabase();
-    await SeniorCareDb.cargarHistorialProfesionalDesdeSupabase();
-    await SeniorCareDb.cargarHistorialAdminDesdeSupabase();
-    eliminarDuplicadosSesionEnMemoria();
-
-    sincronizarHabitacionesConPacientes();
   }
 
   // Navega al panel correcto según el rol guardado en la base de datos.
@@ -3413,6 +3170,12 @@ class _LoginPageState extends State<LoginPage> {
 
     final rol = (await obtenerNombreRol(idRol as int)).toLowerCase();
     await cargarSesionDesdeSupabase(usuario, rol);
+
+    Future(() async {
+      try {
+        await cargarHistorialesSesionDesdeSupabase(rol);
+      } catch (_) {}
+    });
 
     if (rol == 'administrador') {
       Navigator.pushReplacement(

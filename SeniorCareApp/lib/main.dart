@@ -1,10 +1,5 @@
 // SENIORCARE - APLICACIÓN FLUTTER
-// ------------------------------------------------------------
-// Este archivo contiene una versión funcional de la aplicación
-// SeniorCare con datos temporales en memoria. Más adelante,
-// estos datos pueden conectarse a la base de datos relacional
-// definitiva mediante servicios, API o conexión local.
-//
+
 // Módulos incluidos:
 // - Inicio de sesión y creación de cuenta.
 // - Panel de paciente con solicitudes rápidas.
@@ -369,6 +364,24 @@ Map<String, dynamic>? usuarioSesion;
 String rolSesion = '';
 Paciente? pacienteSesion;
 Empleado? empleadoSesion;
+
+// Cache simple de sesión para que las vistas no vuelvan a consultar Supabase
+// innecesariamente. Las pantallas leen desde las listas en memoria y solo se
+// sincronizan de nuevo cuando el usuario presiona el botón de Actualizar.
+bool datosSesionCargados = false;
+bool datosSesionCargando = false;
+String? claveSesionCargada;
+Future<void>? cargaSesionEnCurso;
+
+String claveSesion(Map<String, dynamic> usuario, String rol) {
+  return '${usuario['id_usuario']}|$rol';
+}
+
+void marcarDatosSesionDesactualizados() {
+  datosSesionCargados = false;
+  claveSesionCargada = null;
+  cargaSesionEnCurso = null;
+}
 
 // Clave interna de registro para crear cuentas de administrador.
 // En una aplicación real esta clave NO debe quedar escrita en Flutter.
@@ -1259,10 +1272,10 @@ class SeniorCareDb {
         .from('empleado')
         .insert({
       'rut_empleado': rut,
-      'p_nombre': primerNombre,
-      's_nombre': segundoNombre.isEmpty ? null : segundoNombre,
-      'ap_paterno': apellidoPaterno,
-      'ap_materno': apellidoMaterno,
+      'p_nombre': capitalizarPalabras(primerNombre),
+      's_nombre': segundoNombre.isEmpty ? null : capitalizarPalabras(segundoNombre),
+      'ap_paterno': capitalizarPalabras(apellidoPaterno),
+      'ap_materno': capitalizarPalabras(apellidoMaterno),
       'direccion': direccion,
       'telefono': telefono,
       'id_hogar': idHogar,
@@ -1302,12 +1315,14 @@ class SeniorCareDb {
 
     permiso.idEmpleado = empleado.first.idEmpleado;
 
+    // Supabase usa campos timestamptz. Por eso se envía la hora en UTC
+    // para evitar desfases al leerla nuevamente con toLocal() en Chile.
     final insertado = await db
         .from('permiso_temporal')
         .insert({
       'permiso': permiso.permiso,
-      'fecha_inicio': permiso.inicio.toIso8601String(),
-      'fecha_termino': permiso.termino.toIso8601String(),
+      'fecha_inicio': permiso.inicio.toUtc().toIso8601String(),
+      'fecha_termino': permiso.termino.toUtc().toIso8601String(),
       'estado': permiso.estado,
       'descripcion': 'Permiso temporal otorgado desde administración',
       'id_empleado': permiso.idEmpleado,
@@ -1865,7 +1880,20 @@ bool validarRutChileno(String rut) {
 
 bool validarTelefonoChile(String telefono) {
   final limpio = telefono.replaceAll(RegExp(r'[^0-9]'), '');
-  return limpio.length == 9;
+  return limpio.length == 9 && limpio.startsWith('9');
+}
+
+String capitalizarPalabras(String texto) {
+  return texto
+      .trim()
+      .replaceAll(RegExp(r'\s+'), ' ')
+      .split(' ')
+      .where((palabra) => palabra.isNotEmpty)
+      .map((palabra) {
+    final lower = palabra.toLowerCase();
+    return lower[0].toUpperCase() + lower.substring(1);
+  })
+      .join(' ');
 }
 
 // Recarga los datos reales desde Supabase sin cerrar sesión.
@@ -1877,11 +1905,12 @@ bool validarTelefonoChile(String telefono) {
 // Esta versión carga catálogos completos una sola vez y luego cruza los datos en memoria.
 Future<void> cargarDatosSesionOptimizadoDesdeSupabase(
     Map<String, dynamic> usuario,
-    String rol, {
-      bool cargarHistoriales = true,
-    }) async {
+    String rol,
+    ) async {
   final supabase = Supabase.instance.client;
+  final claveActual = claveSesion(usuario, rol);
 
+  datosSesionCargando = true;
   usuarioSesion = usuario;
   rolSesion = rol;
   pacienteSesion = null;
@@ -2257,15 +2286,6 @@ Future<void> cargarDatosSesionOptimizadoDesdeSupabase(
 
   await SeniorCareDb.cargarPermisosTemporalesDesdeSupabase();
 
-  if (cargarHistoriales) {
-    await cargarHistorialesSesionDesdeSupabase(rol);
-  }
-
-  eliminarDuplicadosSesionEnMemoria();
-  sincronizarHabitacionesConPacientes();
-}
-
-Future<void> cargarHistorialesSesionDesdeSupabase(String rol) async {
   final rolNormalizado = rol.toLowerCase();
 
   // Se cargan solo los historiales necesarios para el rol actual.
@@ -2280,15 +2300,40 @@ Future<void> cargarHistorialesSesionDesdeSupabase(String rol) async {
   } else if (rolNormalizado == 'paciente') {
     // El paciente no necesita cargar historial administrativo completo al iniciar.
   }
+
+  eliminarDuplicadosSesionEnMemoria();
+  sincronizarHabitacionesConPacientes();
+
+  datosSesionCargados = true;
+  claveSesionCargada = claveActual;
+  datosSesionCargando = false;
 }
 
 
-Future<void> cargarSesionActualDesdeSupabase() async {
+Future<void> cargarSesionActualDesdeSupabase({bool forzar = false}) async {
   final usuario = usuarioSesion;
   final rol = rolSesion;
   if (usuario == null || rol.isEmpty) return;
 
-  await cargarDatosSesionOptimizadoDesdeSupabase(usuario, rol);
+  final claveActual = claveSesion(usuario, rol);
+
+  if (!forzar && datosSesionCargados && claveSesionCargada == claveActual) {
+    actualizarPermisosTemporalesEnMemoria();
+    sincronizarHabitacionesConPacientes();
+    return;
+  }
+
+  if (!forzar && cargaSesionEnCurso != null) {
+    await cargaSesionEnCurso;
+    return;
+  }
+
+  cargaSesionEnCurso = cargarDatosSesionOptimizadoDesdeSupabase(usuario, rol);
+  try {
+    await cargaSesionEnCurso;
+  } finally {
+    cargaSesionEnCurso = null;
+  }
 }
 
 Future<void> refrescarSesionActual(
@@ -2296,7 +2341,7 @@ Future<void> refrescarSesionActual(
     Widget homePage,
     ) async {
   try {
-    await cargarSesionActualDesdeSupabase();
+    await cargarSesionActualDesdeSupabase(forzar: true);
     if (!context.mounted) return;
     ScaffoldMessenger.of(context).showSnackBar(
       const SnackBar(content: Text('Datos actualizados correctamente')),
@@ -3127,13 +3172,19 @@ class _LoginPageState extends State<LoginPage> {
       Map<String, dynamic> usuario,
       String rol,
       ) async {
-    // Carga liviana para entrar más rápido al sistema.
-    // Los historiales se cargan en segundo plano después de abrir la vista.
-    await cargarDatosSesionOptimizadoDesdeSupabase(
-      usuario,
-      rol,
-      cargarHistoriales: false,
-    );
+    final claveActual = claveSesion(usuario, rol);
+
+    // Si el mismo usuario ya cargó los datos, no se consulta de nuevo.
+    // Esto permite que la navegación posterior sea casi inmediata.
+    if (datosSesionCargados && claveSesionCargada == claveActual) {
+      usuarioSesion = usuario;
+      rolSesion = rol;
+      actualizarPermisosTemporalesEnMemoria();
+      sincronizarHabitacionesConPacientes();
+      return;
+    }
+
+    await cargarDatosSesionOptimizadoDesdeSupabase(usuario, rol);
   }
 
   // Navega al panel correcto según el rol guardado en la base de datos.
@@ -3171,12 +3222,6 @@ class _LoginPageState extends State<LoginPage> {
     final rol = (await obtenerNombreRol(idRol as int)).toLowerCase();
     await cargarSesionDesdeSupabase(usuario, rol);
 
-    Future(() async {
-      try {
-        await cargarHistorialesSesionDesdeSupabase(rol);
-      } catch (_) {}
-    });
-
     if (rol == 'administrador') {
       Navigator.pushReplacement(
         context,
@@ -3201,6 +3246,55 @@ class _LoginPageState extends State<LoginPage> {
           backgroundColor: Colors.red,
         ),
       );
+    }
+  }
+
+
+  // Inicia sesión rápida con usuarios reales de demostración.
+  // Estos usuarios deben existir previamente en la tabla usuario de Supabase.
+  // Todos usan la contraseña 123456 y navegan con la misma lógica del login normal.
+  Future<void> iniciarSesionDemo(String correoDemo) async {
+    setState(() => cargandoAuth = true);
+
+    try {
+      final usuario = await buscarUsuarioPorCorreo(correoDemo);
+
+      if (usuario == null) {
+        if (!mounted) return;
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(
+            content: Text('No existe el usuario demo: $correoDemo'),
+            backgroundColor: Colors.red,
+          ),
+        );
+        return;
+      }
+
+      final contrasenaBd = (usuario['contrasena'] ?? '').toString();
+
+      if (contrasenaBd != '123456') {
+        if (!mounted) return;
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(
+            content: Text('La contraseña del usuario demo no coincide.'),
+            backgroundColor: Colors.red,
+          ),
+        );
+        return;
+      }
+
+      if (!mounted) return;
+      await navegarSegunRol(usuario);
+    } catch (e) {
+      if (!mounted) return;
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(
+          content: Text(mensajeErrorSupabase(e)),
+          backgroundColor: Colors.red,
+        ),
+      );
+    } finally {
+      if (mounted) setState(() => cargandoAuth = false);
     }
   }
 
@@ -3381,10 +3475,10 @@ class _LoginPageState extends State<LoginPage> {
     final contrasena = nuevaPasswordController.text.trim();
     final confirmar = confirmarPasswordController.text.trim();
     final rut = formatearRut(limpiarRut(rutController.text.trim()));
-    final primerNombre = primerNombreController.text.trim();
-    final segundoNombre = segundoNombreController.text.trim();
-    final apellidoPaterno = apellidoPaternoController.text.trim();
-    final apellidoMaterno = apellidoMaternoController.text.trim();
+    final primerNombre = capitalizarPalabras(primerNombreController.text);
+    final segundoNombre = capitalizarPalabras(segundoNombreController.text);
+    final apellidoPaterno = capitalizarPalabras(apellidoPaternoController.text);
+    final apellidoMaterno = capitalizarPalabras(apellidoMaternoController.text);
     final direccion = direccionController.text.trim();
     final telefono = telefonoController.text.trim().replaceAll(
       RegExp(r'[^0-9]'),
@@ -3481,7 +3575,7 @@ class _LoginPageState extends State<LoginPage> {
         ScaffoldMessenger.of(context).showSnackBar(
           const SnackBar(
             content: Text(
-              'El teléfono debe tener exactamente 9 números, por ejemplo 912345678.',
+              'El teléfono debe tener 9 números y comenzar con 9, por ejemplo 912345678.',
             ),
             backgroundColor: Colors.red,
           ),
@@ -3694,6 +3788,52 @@ class _LoginPageState extends State<LoginPage> {
             child: const Text('¿Olvidaste tu contraseña?'),
           ),
         ),
+        const SizedBox(height: 10),
+        const Divider(),
+        const SizedBox(height: 10),
+        const Center(
+          child: Text(
+            'Accesos rápidos de demostración',
+            style: TextStyle(
+              fontWeight: FontWeight.bold,
+              fontSize: 14,
+            ),
+          ),
+        ),
+        const SizedBox(height: 12),
+        SizedBox(
+          width: double.infinity,
+          child: OutlinedButton.icon(
+            onPressed: cargandoAuth
+                ? null
+                : () => iniciarSesionDemo('admin.seniorcare@gmail.com'),
+            icon: const Icon(Icons.admin_panel_settings),
+            label: const Text('Entrar como Administrador'),
+          ),
+        ),
+        const SizedBox(height: 8),
+        SizedBox(
+          width: double.infinity,
+          child: OutlinedButton.icon(
+            onPressed: cargandoAuth
+                ? null
+                : () => iniciarSesionDemo('empleado.seniorcare@gmail.com'),
+            icon: const Icon(Icons.badge),
+            label: const Text('Entrar como Empleado'),
+          ),
+        ),
+        const SizedBox(height: 8),
+        SizedBox(
+          width: double.infinity,
+          child: OutlinedButton.icon(
+            onPressed: cargandoAuth
+                ? null
+                : () => iniciarSesionDemo('paciente.seniorcare@gmail.com'),
+            icon: const Icon(Icons.elderly),
+            label: const Text('Entrar como Paciente'),
+          ),
+        ),
+        const SizedBox(height: 14),
         Container(
           width: double.infinity,
           padding: const EdgeInsets.all(14),
@@ -3702,7 +3842,7 @@ class _LoginPageState extends State<LoginPage> {
             borderRadius: BorderRadius.circular(12),
           ),
           child: const Text(
-            'Para ingresar debes tener una cuenta creada en la tabla usuario de Supabase y usar correo @gmail.com.',
+            'Puedes ingresar normalmente con correo y contraseña, o usar los accesos rápidos de demostración para probar cada rol.',
             style: TextStyle(fontSize: 12),
           ),
         ),
@@ -3775,8 +3915,9 @@ class _LoginPageState extends State<LoginPage> {
               LengthLimitingTextInputFormatter(9),
             ],
             decoration: inputDecoration().copyWith(
+              prefixText: '+56 ',
               hintText: '912345678',
-              helperText: 'Ingresa 9 números, sin +56.',
+              helperText: 'Ingresa 9 números y debe comenzar con 9.',
             ),
           ),
           label('Dirección'),
@@ -4696,7 +4837,8 @@ class _EmployeesPageState extends State<EmployeesPage> {
                   ],
                   decoration: inputDecoration().copyWith(
                     labelText: 'Teléfono',
-                    helperText: 'Ingresa 9 números, sin +56.',
+                    prefixText: '+56 ',
+                    helperText: 'Ingresa 9 números y debe comenzar con 9.',
                   ),
                 ),
                 const SizedBox(height: 10),
@@ -4724,14 +4866,21 @@ class _EmployeesPageState extends State<EmployeesPage> {
             FilledButton(
               onPressed: () async {
                 final correo = correoCtrl.text.trim().toLowerCase();
-                final telefono = telefonoCtrl.text.trim();
+                final telefono = telefonoCtrl.text.trim().replaceAll(
+                  RegExp(r'[^0-9]'),
+                  '',
+                );
                 final rut = formatearRut(limpiarRut(rutCtrl.text.trim()));
+                final primerNombre = capitalizarPalabras(pNombreCtrl.text);
+                final segundoNombre = capitalizarPalabras(sNombreCtrl.text);
+                final apellidoPaterno = capitalizarPalabras(apPatCtrl.text);
+                final apellidoMaterno = capitalizarPalabras(apMatCtrl.text);
                 if (usuarioCtrl.text.trim().isEmpty ||
                     correo.isEmpty ||
                     passCtrl.text.trim().isEmpty ||
-                    pNombreCtrl.text.trim().isEmpty ||
-                    apPatCtrl.text.trim().isEmpty ||
-                    apMatCtrl.text.trim().isEmpty ||
+                    primerNombre.isEmpty ||
+                    apellidoPaterno.isEmpty ||
+                    apellidoMaterno.isEmpty ||
                     direccionCtrl.text.trim().isEmpty ||
                     telefono.isEmpty) {
                   ScaffoldMessenger.of(context).showSnackBar(
@@ -4777,7 +4926,7 @@ class _EmployeesPageState extends State<EmployeesPage> {
                   ScaffoldMessenger.of(context).showSnackBar(
                     const SnackBar(
                       content: Text(
-                        'El teléfono debe tener exactamente 9 números.',
+                        'El teléfono debe tener 9 números y comenzar con 9.',
                       ),
                       backgroundColor: Colors.red,
                     ),
@@ -4791,10 +4940,10 @@ class _EmployeesPageState extends State<EmployeesPage> {
                     correo: correo,
                     contrasena: passCtrl.text.trim(),
                     rut: rut,
-                    primerNombre: pNombreCtrl.text.trim(),
-                    segundoNombre: sNombreCtrl.text.trim(),
-                    apellidoPaterno: apPatCtrl.text.trim(),
-                    apellidoMaterno: apMatCtrl.text.trim(),
+                    primerNombre: primerNombre,
+                    segundoNombre: segundoNombre,
+                    apellidoPaterno: apellidoPaterno,
+                    apellidoMaterno: apellidoMaterno,
                     direccion: direccionCtrl.text.trim(),
                     telefono: telefono,
                     idCargo: idCargo,
@@ -5028,6 +5177,33 @@ class _RequestsPageState extends State<RequestsPage> {
   }
 
   void asignarSolicitud(BuildContext context, Solicitud solicitud) {
+    final pacienteRelacionado = pacientes
+        .where((p) => p.nombre == solicitud.paciente)
+        .toList();
+
+    if (pacienteRelacionado.isNotEmpty &&
+        pacienteRelacionado.first.estado.toLowerCase() == 'inactivo') {
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(
+          content: Text(
+            'No se puede asignar esta solicitud porque el paciente ${solicitud.paciente} está inactivo.',
+          ),
+          backgroundColor: Colors.red,
+        ),
+      );
+      return;
+    }
+
+    if (empleados.isEmpty) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(
+          content: Text('No existen empleados disponibles para asignar.'),
+          backgroundColor: Colors.red,
+        ),
+      );
+      return;
+    }
+
     String empleadoSeleccionado = solicitud.asignadoA != 'Sin asignar'
         ? solicitud.asignadoA
         : empleados.first.nombre;
@@ -6258,26 +6434,104 @@ class _PermissionsPageState extends State<PermissionsPage> {
 }
 
 // Vista del historial general de acciones administrativas y trazabilidad.
-class AdminHistoryPage extends StatelessWidget {
+class AdminHistoryPage extends StatefulWidget {
   const AdminHistoryPage({super.key});
 
   @override
+  State<AdminHistoryPage> createState() => _AdminHistoryPageState();
+}
+
+class _AdminHistoryPageState extends State<AdminHistoryPage> {
+  String filtroBusqueda = '';
+  String filtroTipo = 'Todos';
+
+  @override
   Widget build(BuildContext context) {
+    final tipos = [
+      'Todos',
+      'Solicitud',
+      'Paciente',
+      'Empleado',
+      'Permiso',
+      'Habitación',
+      'Turno',
+    ];
+
+    final registrosFiltrados = historialAdmin.where((h) {
+      final texto = '${h.accion} ${h.detalle} ${h.responsable} ${h.fecha}'
+          .toLowerCase();
+
+      final coincideBusqueda = filtroBusqueda.trim().isEmpty ||
+          texto.contains(filtroBusqueda.trim().toLowerCase());
+
+      final accion = h.accion.toLowerCase();
+      final detalle = h.detalle.toLowerCase();
+      final tipo = filtroTipo.toLowerCase();
+
+      final coincideTipo = filtroTipo == 'Todos' ||
+          accion.contains(tipo) ||
+          detalle.contains(tipo);
+
+      return coincideBusqueda && coincideTipo;
+    }).toList();
+
     return AdminLayout(
       title: 'Historial del Administrador',
       subtitle: 'Registro de cancelaciones, asignaciones y cambios importantes',
       child: Column(
         children: [
-          if (historialAdmin.isEmpty)
+          Container(
+            padding: const EdgeInsets.all(18),
+            decoration: cardDecoration(),
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                const Text(
+                  'Filtros de búsqueda',
+                  style: TextStyle(fontWeight: FontWeight.bold),
+                ),
+                const SizedBox(height: 12),
+                TextField(
+                  decoration: inputDecoration().copyWith(
+                    labelText: 'Buscar acción, detalle, responsable o fecha',
+                    prefixIcon: const Icon(Icons.search),
+                  ),
+                  onChanged: (value) {
+                    setState(() => filtroBusqueda = value);
+                  },
+                ),
+                const SizedBox(height: 12),
+                DropdownButtonFormField<String>(
+                  value: filtroTipo,
+                  decoration: inputDecoration().copyWith(
+                    labelText: 'Tipo de acción',
+                  ),
+                  items: tipos
+                      .map(
+                        (t) => DropdownMenuItem(
+                      value: t,
+                      child: Text(t),
+                    ),
+                  )
+                      .toList(),
+                  onChanged: (value) {
+                    setState(() => filtroTipo = value!);
+                  },
+                ),
+              ],
+            ),
+          ),
+          const SizedBox(height: 20),
+          if (registrosFiltrados.isEmpty)
             Container(
               width: double.infinity,
               padding: const EdgeInsets.all(30),
               decoration: cardDecoration(),
               child: const Center(
-                child: Text('Aún no existen acciones registradas.'),
+                child: Text('No existen acciones que coincidan con el filtro.'),
               ),
             ),
-          ...historialAdmin.map(
+          ...registrosFiltrados.map(
                 (h) => listCard(
               title: h.accion,
               subtitle: h.detalle,
@@ -6400,7 +6654,29 @@ Future<void> refrescarVistaActual(
     Widget homePage,
     ) async {
   try {
-    await cargarSesionActualDesdeSupabase();
+    // Optimización: no todas las vistas necesitan recargar toda la sesión.
+    // Para las pantallas de historial o permisos se actualizan solo esos datos.
+    // Para paneles con datos cruzados, como solicitudes, pacientes o habitaciones,
+    // se mantiene la recarga completa para conservar la consistencia del sistema.
+    if (role == 'Administrador') {
+      switch (title) {
+        case 'Historial del Administrador':
+          await SeniorCareDb.cargarHistorialAdminDesdeSupabase();
+          break;
+        case 'Historial de Pacientes Inactivos':
+          await SeniorCareDb.cargarHistorialPacientesInactivosDesdeSupabase();
+          break;
+        case 'Permisos Temporales':
+          await SeniorCareDb.cargarPermisosTemporalesDesdeSupabase();
+          actualizarPermisosTemporalesEnMemoria();
+          break;
+        default:
+          await cargarSesionActualDesdeSupabase(forzar: true);
+      }
+    } else {
+      await cargarSesionActualDesdeSupabase(forzar: true);
+    }
+
     if (!context.mounted) return;
     ScaffoldMessenger.of(context).showSnackBar(
       const SnackBar(content: Text('Datos actualizados correctamente')),
@@ -6493,10 +6769,13 @@ class BaseLayout extends StatelessWidget {
           ),
           const SizedBox(width: 8),
           TextButton.icon(
-            onPressed: () => Navigator.pushReplacement(
-              context,
-              MaterialPageRoute(builder: (_) => const LoginPage()),
-            ),
+            onPressed: () {
+              marcarDatosSesionDesactualizados();
+              Navigator.pushReplacement(
+                context,
+                MaterialPageRoute(builder: (_) => const LoginPage()),
+              );
+            },
             icon: const Icon(Icons.logout, color: Colors.red),
             label: isMobile
                 ? const SizedBox.shrink()

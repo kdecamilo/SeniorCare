@@ -1092,7 +1092,7 @@ Widget paginaProfesionalActualPorTitulo(String title) {
 
 Future<void> refrescarVistaProfesional(BuildContext context, String title) async {
   try {
-    await cargarSesionActualDesdeSupabase();
+    await cargarSesionActualDesdeSupabase(forzar: true);
     if (!context.mounted) return;
     ScaffoldMessenger.of(context).showSnackBar(
       const SnackBar(content: Text('Datos actualizados correctamente')),
@@ -1121,6 +1121,89 @@ class ProfessionalLayout extends StatelessWidget {
     required this.subtitle,
     required this.child,
   });
+
+
+  Widget bannerPermisoTemporal() {
+    if (empleadoSesion == null || !empleadoSesion!.permisoAdminTemporal) {
+      return const SizedBox.shrink();
+    }
+
+    final permisosActivos = permisosTemporales
+        .where(
+          (p) =>
+      p.empleado == empleadoSesion!.nombre &&
+          p.estado == 'Activo' &&
+          p.activoAhora,
+    )
+        .toList();
+
+    if (permisosActivos.isEmpty) {
+      return const SizedBox.shrink();
+    }
+
+    permisosActivos.sort((a, b) => a.termino.compareTo(b.termino));
+    final permiso = permisosActivos.first;
+
+    return Container(
+      width: double.infinity,
+      margin: const EdgeInsets.only(bottom: 20),
+      padding: const EdgeInsets.all(16),
+      decoration: BoxDecoration(
+        color: const Color(0xFFE8F5E9),
+        borderRadius: BorderRadius.circular(14),
+        border: Border.all(color: Colors.green.shade700),
+        boxShadow: [
+          BoxShadow(
+            color: Colors.black.withOpacity(0.06),
+            blurRadius: 8,
+            offset: const Offset(0, 3),
+          ),
+        ],
+      ),
+      child: Row(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Container(
+            padding: const EdgeInsets.all(9),
+            decoration: BoxDecoration(
+              color: Colors.green.shade100,
+              borderRadius: BorderRadius.circular(12),
+            ),
+            child: const Icon(
+              Icons.admin_panel_settings,
+              color: Colors.green,
+              size: 30,
+            ),
+          ),
+          const SizedBox(width: 14),
+          Expanded(
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                const Text(
+                  'Permiso temporal activo',
+                  style: TextStyle(
+                    fontSize: 17,
+                    fontWeight: FontWeight.bold,
+                    color: Colors.green,
+                  ),
+                ),
+                const SizedBox(height: 6),
+                Text(
+                  'El administrador te otorgó el permiso: ${permiso.permiso}.',
+                ),
+                const SizedBox(height: 6),
+                Text(
+                  'Válido hasta las ${formatTime(permiso.termino)} hrs.',
+                  style: const TextStyle(fontWeight: FontWeight.w600),
+                ),
+              ],
+            ),
+          ),
+        ],
+      ),
+    );
+  }
 
   @override
   Widget build(BuildContext context) {
@@ -1181,6 +1264,7 @@ class ProfessionalLayout extends StatelessWidget {
             child: Column(
               crossAxisAlignment: CrossAxisAlignment.start,
               children: [
+                bannerPermisoTemporal(),
                 Text(
                   title,
                   style: TextStyle(
